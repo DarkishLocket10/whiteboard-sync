@@ -25,7 +25,7 @@ def make_syncer(tmp_path, missing_to_complete=2):
         presence_entity="person.x", todo_entity="todo.inbox",
         todoist_project="Inbox", interval_s=900, change_threshold=4.0,
         missing_to_complete=missing_to_complete, scan_when_home=False,
-        model="qwen3-vl:8b", data_dir=tmp_path,
+        model="qwen3-vl:8b-instruct", data_dir=tmp_path,
     )
     return Syncer(cfg, FakeHA(), reader=None)
 
@@ -96,6 +96,26 @@ def test_state_persists_across_restarts(tmp_path):
     s.reconcile({"work": ["Fix dashboard"], "personal": []})
     reloaded = make_syncer(tmp_path)
     assert reloaded.state["items"] == [{"text": "Fix dashboard", "board": "work", "missing": 0}]
+
+
+def test_obstructed_scan_touches_nothing(tmp_path):
+    import numpy as np
+
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["Fix dashboard"], "personal": []})
+    s.ha.calls.clear()
+
+    class ObstructedReader:
+        def read(self, jpeg):
+            return {"obstructed": True, "work": [], "personal": []}
+
+    s.reader = ObstructedReader()
+    s._fetch_crop = lambda: (b"jpeg", np.zeros((5, 5), dtype=np.float32))
+    result = s.scan(force=True)
+    assert result["obstructed"] is True
+    assert s.ha.calls == []                          # no completions fired
+    assert s.state["items"][0]["missing"] == 0       # no miss counted
+    assert not (tmp_path / "baseline.npy").exists()  # baseline untouched
 
 
 def test_dry_run_touches_nothing(tmp_path):

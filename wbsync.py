@@ -51,9 +51,12 @@ HTTP_PORT = 8430
 READ_PROMPT = """\
 This photo shows two whiteboards side by side.
 The LEFT board holds WORK to-do items. The RIGHT board holds PERSONAL to-do items.
-Transcribe every item that is still OPEN: its checkbox is empty (not ticked)
-and it is not crossed out or erased. Skip completed items, headings, name tags,
-stickers, photos, and anything that is not a list item.
+First, set "obstructed" to true if a person, chair, or any object blocks or
+covers ANY part of either whiteboard, or if a board is not fully visible in
+the photo — otherwise false.
+Then transcribe every item that is still OPEN: its checkbox is empty (not
+ticked) and it is not crossed out or erased. Skip completed items, headings,
+name tags, stickers, photos, and anything that is not a list item.
 Write each item as a short task phrase without bullet or checkbox characters,
 fixing obvious handwriting artifacts. If a board is empty or unreadable,
 return an empty list for it."""
@@ -61,10 +64,11 @@ return an empty list for it."""
 READ_SCHEMA = {
     "type": "object",
     "properties": {
+        "obstructed": {"type": "boolean"},
         "work": {"type": "array", "items": {"type": "string"}},
         "personal": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["work", "personal"],
+    "required": ["obstructed", "work", "personal"],
     "additionalProperties": False,
 }
 
@@ -110,7 +114,7 @@ class Config:
             change_threshold=float(env("WB_CHANGE_THRESHOLD", "4.0")),
             missing_to_complete=int(env("WB_MISSING_TO_COMPLETE", "2")),
             scan_when_home=env("WB_SCAN_WHEN_HOME", "false").lower() in ("1", "true", "yes"),
-            model=env("WB_MODEL", "qwen3-vl:8b"),
+            model=env("WB_MODEL", "qwen3-vl:8b-instruct"),
             data_dir=Path(env("WB_DATA_DIR", "/data")),
         )
 
@@ -292,6 +296,11 @@ class Syncer:
             except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
                 log.warning("board read failed: %s", exc)
                 return self._done({"ok": False, "error": f"read failed: {exc}"})
+            if seen.get("obstructed"):
+                # Someone/something is blocking a board (presence lag, guest,
+                # chair). Items behind the obstruction would read as "missing"
+                # and could be falsely completed — touch nothing, retry later.
+                return self._done({"ok": True, "changed": True, "obstructed": True})
             result = self.reconcile(seen, apply=not dry)
             if not dry:
                 np.save(self._baseline_path, gray)  # only after a processed read

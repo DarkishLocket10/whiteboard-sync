@@ -22,7 +22,7 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
 ## Sharp edges
 
 - `.env` is gitignored and holds the HA token. Scans need the Ollama model
-  pulled: `docker exec ollama ollama pull qwen3-vl:8b`.
+  pulled: `docker exec ollama ollama pull qwen3-vl:8b-instruct`.
 - `data/state.json` item texts are canonical — they must stay byte-identical
   to the Todoist task summaries or completions can't find their task. Don't
   "clean up" state by hand while tasks are open.
