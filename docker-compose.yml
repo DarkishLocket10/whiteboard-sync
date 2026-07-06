@@ -1,0 +1,19 @@
+# whiteboard-sync — reads the whiteboards through kinect-knob's camera and
+# keeps Todoist in sync via Home Assistant. See README.md; config in .env.
+services:
+  whiteboard-sync:
+    build: .
+    image: whiteboard-sync:local
+    container_name: whiteboard-sync
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8430:8430"
+    volumes:
+      # Sync state + change-detection baseline persist here.
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
