@@ -288,6 +288,15 @@ def test_boards_are_reconciled_independently(tmp_path):
                                  "status": "open", "missing": 0, "ticked": 0}]
 
 
+def test_new_tasks_get_due_today_unless_disabled(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["with date"], "personal": []})
+    assert s.ha.calls[-1][2]["due_date_string"] == "today"
+    s.update_settings({"due_today": False})
+    s.reconcile({"work": ["without date"], "personal": []})
+    assert "due_date_string" not in s.ha.calls[-1][2]
+
+
 def test_ticked_item_completes_and_stays_tracked_as_done(tmp_path):
     s = make_syncer(tmp_path)
     s.reconcile({"work": ["Fix dashboard"], "personal": []})

@@ -170,7 +170,8 @@ Environment variables (in `.env`) set the **defaults**:
 `data/settings.json`:
 
 `enabled` · `presence_gate` · `change_detection` · `obstruction_guard` ·
-`enhance` · `interval_s` · `change_threshold` · `missing_to_complete` ·
+`enhance` · `due_today` (new tasks land in Todoist's Today view) ·
+`interval_s` · `change_threshold` · `missing_to_complete` ·
 `ticked_to_complete` · `capture_frames` (1–32 stacked per photo) ·
 `capture_quality` · `capture_format` (`jpeg`/`png` to the model) ·
 `upscale` (1–2×)

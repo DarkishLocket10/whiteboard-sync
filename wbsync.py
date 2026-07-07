@@ -65,6 +65,7 @@ SETTING_BOUNDS = {
     "change_detection": bool,    # skip the vision read when the crop hasn't changed
     "obstruction_guard": bool,   # skip reconcile when the model sees an obstruction
     "enhance": bool,             # autocontrast + unsharp mask on the crop
+    "due_today": bool,           # new tasks get due "today" (Todoist Today view)
     "interval_s": (int, 60, 86400),
     "change_threshold": (float, 0.1, 50.0),
     "missing_to_complete": (int, 1, 10),
@@ -283,6 +284,7 @@ class Syncer:
             "change_detection": True,
             "obstruction_guard": True,
             "enhance": True,
+            "due_today": True,
             "interval_s": cfg.interval_s,
             "change_threshold": cfg.change_threshold,
             "missing_to_complete": cfg.missing_to_complete,
@@ -453,11 +455,16 @@ class Syncer:
                 if not apply:
                     added.append(text)
                     continue
-                if self.ha.call("todoist", "new_task", {
+                task = {
                     "content": text,
                     "project": self.cfg.todoist_project,
                     "labels": ["whiteboard", board],
-                }):
+                }
+                if self.settings["due_today"]:
+                    # Todoist parses this in the ACCOUNT's timezone — safer
+                    # than a date computed on this container's (UTC) clock.
+                    task["due_date_string"] = "today"
+                if self.ha.call("todoist", "new_task", task):
                     self.state["items"].append({"text": text, "board": board,
                                                 "status": "open", "missing": 0,
                                                 "ticked": 0})
@@ -864,6 +871,7 @@ const SETTINGS_UI = [
   ['change_detection', 'bool', 'Skip unchanged frames'],
   ['obstruction_guard', 'bool', 'Skip when obstructed'],
   ['enhance', 'bool', 'Enhance photo (contrast+sharpen)'],
+  ['due_today', 'bool', 'New tasks due today'],
   ['interval_s', 'num', 'Scan interval (s)', { min: 60, max: 86400, step: 60 }],
   ['change_threshold', 'num', 'Change threshold', { min: 0.1, max: 50, step: 0.5 }],
   ['missing_to_complete', 'num', 'Misses to complete', { min: 1, max: 10, step: 1 }],
