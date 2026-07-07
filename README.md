@@ -40,6 +40,11 @@ scan and skip. Buttons trigger a forced or dry-run scan.
 - `GET /crop.jpg` — most recent cropped board photo
 - `POST /scan` (`?force=1` bypass change detection, `?dry=1` report only,
   touch nothing) — scan now
+- `POST /api/settings` — runtime toggles/tuning as a JSON object; the
+  dashboard's Controls card uses this. Settings: `enabled`, `presence_gate`,
+  `change_detection`, `obstruction_guard`, `enhance`, `interval_s`,
+  `change_threshold`, `missing_to_complete`, `capture_frames` (multi-frame
+  stacking via kinect-knob), `capture_quality`, `capture_format`, `upscale`.
 
-Scan history persists in `data/history.jsonl`; the latest crop in
-`data/last_crop.jpg`.
+Scan history persists in `data/history.jsonl`, runtime settings in
+`data/settings.json`, the latest crop in `data/last_crop.jpg`.

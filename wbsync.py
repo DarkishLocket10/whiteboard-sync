@@ -46,13 +46,30 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 
 log = logging.getLogger("wbsync")
 
 FUZZY_MATCH_RATIO = 0.8
 HTTP_PORT = 8430
 HISTORY_KEEP = 400  # scan/skip records kept in memory and in data/history.jsonl
+
+# Runtime-tunable settings (dashboard toggles, persisted in data/settings.json;
+# env vars provide the defaults). key -> bool | (type, lo, hi) | enum tuple.
+SETTING_BOUNDS = {
+    "enabled": bool,             # master switch for scheduled scans
+    "presence_gate": bool,       # only scan while the presence entity is away
+    "change_detection": bool,    # skip the vision read when the crop hasn't changed
+    "obstruction_guard": bool,   # skip reconcile when the model sees an obstruction
+    "enhance": bool,             # autocontrast + unsharp mask on the crop
+    "interval_s": (int, 60, 86400),
+    "change_threshold": (float, 0.1, 50.0),
+    "missing_to_complete": (int, 1, 10),
+    "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
+    "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
+    "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
+    "capture_format": ("jpeg", "png"),   # encoding sent to the vision model
+}
 
 READ_PROMPT = """\
 This photo shows two whiteboards side by side.
@@ -233,9 +250,32 @@ class Syncer:
         self.loop_beat = time.time()
         self.gate: dict = {}  # last presence-gate skip, for the dashboard
         self.counters = {"scans": 0, "changed": 0, "unchanged": 0, "obstructed": 0,
-                         "errors": 0, "added": 0, "completed": 0, "skips_home": 0}
+                         "errors": 0, "added": 0, "completed": 0, "skips_home": 0,
+                         "skips_off": 0}
         self._presence: Optional[str] = None
         self._presence_t = 0.0
+        self._settings_path = cfg.data_dir / "settings.json"
+        self.settings = {
+            "enabled": True,
+            "presence_gate": not cfg.scan_when_home,
+            "change_detection": True,
+            "obstruction_guard": True,
+            "enhance": True,
+            "interval_s": cfg.interval_s,
+            "change_threshold": cfg.change_threshold,
+            "missing_to_complete": cfg.missing_to_complete,
+            "capture_frames": 8,
+            "capture_quality": 92,
+            "upscale": 1,
+            "capture_format": "jpeg",
+        }
+        if self._settings_path.is_file():
+            try:
+                saved = json.loads(self._settings_path.read_text())
+                self.settings.update(
+                    {k: v for k, v in saved.items() if k in self.settings})
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("settings.json unreadable (%s), using defaults", exc)
         self.crop_t: Optional[float] = (
             self.crop_path.stat().st_mtime if self.crop_path.is_file() else None)
         self.history: list[dict] = []
@@ -249,24 +289,80 @@ class Syncer:
             self._history_path.write_text(
                 "".join(json.dumps(e) + "\n" for e in self.history))
 
+    # -- settings ---------------------------------------------------------
+    def update_settings(self, patch: dict) -> dict:
+        """Validate + apply a runtime settings patch from the dashboard.
+        Returns {'applied': {...}, 'rejected': {key: reason}}."""
+        applied, rejected = {}, {}
+        for key, val in patch.items():
+            spec = SETTING_BOUNDS.get(key)
+            if spec is None:
+                rejected[key] = "unknown setting"
+                continue
+            try:
+                if spec is bool:
+                    if not isinstance(val, bool):
+                        raise ValueError("want true/false")
+                    new = val
+                elif callable(spec[0]):
+                    typ, lo, hi = spec
+                    new = typ(val)
+                    if not lo <= new <= hi:
+                        raise ValueError(f"out of range {lo}..{hi}")
+                else:  # enum of strings
+                    new = str(val).lower()
+                    if new not in spec:
+                        raise ValueError(f"want one of {spec}")
+            except (TypeError, ValueError) as exc:
+                rejected[key] = str(exc)
+                continue
+            if self.settings[key] != new:
+                applied[key] = new
+        if applied:
+            self.settings.update(applied)
+            write_json_atomic(self._settings_path, self.settings)
+            self._record({"type": "settings", "changed": applied})
+            log.info("settings changed: %s", json.dumps(applied))
+        return {"applied": applied, "rejected": rejected}
+
     # -- imaging --------------------------------------------------------
     def _fetch_crop(self) -> tuple[bytes, np.ndarray]:
-        r = requests.get(f"{self.cfg.kinect_url}/api/snapshot", timeout=15)
+        s = self.settings
+        # Ask kinect-knob for a stacked, losslessly-encoded photo; an older
+        # kinect-knob simply ignores unknown params and returns its JPEG.
+        params = {"format": "png"}
+        if s["capture_frames"] > 1:
+            params["frames"] = s["capture_frames"]
+        r = requests.get(f"{self.cfg.kinect_url}/api/snapshot", params=params,
+                         timeout=15 + 2 * s["capture_frames"])
         r.raise_for_status()
         img = Image.open(io.BytesIO(r.content))
-        crop = img.crop(self.cfg.region)
+        crop = img.crop(self.cfg.region).convert("RGB")
+        # The baseline compares the RAW crop — toggling enhance/upscale must
+        # not read as "the board changed".
         gray = np.asarray(crop.convert("L"), dtype=np.float32)
+        if s["enhance"]:
+            crop = ImageOps.autocontrast(crop, cutoff=1)
+            crop = crop.filter(ImageFilter.UnsharpMask(radius=2, percent=80, threshold=2))
+        if s["upscale"] > 1:
+            crop = crop.resize(
+                (crop.width * s["upscale"], crop.height * s["upscale"]), Image.LANCZOS)
         buf = io.BytesIO()
-        crop.save(buf, format="JPEG", quality=92)
-        jpeg = buf.getvalue()
+        if s["capture_format"] == "png":
+            crop.save(buf, format="PNG")
+        else:
+            crop.save(buf, format="JPEG", quality=s["capture_quality"])
+        payload = buf.getvalue()
         try:
+            disp = io.BytesIO()
+            crop.save(disp, format="JPEG", quality=90)  # dashboard copy = model's view
             tmp = self.crop_path.with_name(self.crop_path.name + ".tmp")
-            tmp.write_bytes(jpeg)
+            tmp.write_bytes(disp.getvalue())
             tmp.replace(self.crop_path)  # never serve a half-written image
             self.crop_t = time.time()
         except OSError as exc:
             log.warning("crop save failed: %s", exc)
-        return jpeg, gray
+        return payload, gray
 
     def _diff_score(self, gray: np.ndarray) -> Optional[float]:
         """Mean abs pixel difference vs the last processed read. None means
@@ -321,11 +417,11 @@ class Syncer:
                         item["missing"] = 0
                     continue
                 if not apply:
-                    if item["missing"] + 1 >= self.cfg.missing_to_complete:
+                    if item["missing"] + 1 >= self.settings["missing_to_complete"]:
                         completed.append(item["text"])
                     continue
                 item["missing"] += 1
-                if item["missing"] >= self.cfg.missing_to_complete:
+                if item["missing"] >= self.settings["missing_to_complete"]:
                     if self.ha.call("todo", "update_item", {
                         "entity_id": self.cfg.todo_entity,
                         "item": item["text"],
@@ -362,9 +458,11 @@ class Syncer:
             jpeg, gray = self._fetch_crop()
         except requests.RequestException as exc:
             return {"ok": False, "error": f"snapshot failed: {exc}"}
+        s = self.settings
         diff = self._diff_score(gray)
         base = {"diff": None if diff is None else round(diff, 2)}
-        if not force and diff is not None and diff < self.cfg.change_threshold:
+        if (not force and s["change_detection"] and diff is not None
+                and diff < s["change_threshold"]):
             return {"ok": True, "changed": False, **base}
         try:
             seen = self.reader.read(jpeg)
@@ -372,10 +470,12 @@ class Syncer:
             log.warning("board read failed: %s", exc)
             return {"ok": False, "error": f"read failed: {exc}", **base}
         if seen.get("obstructed"):
-            # Someone/something is blocking a board (presence lag, guest,
-            # chair). Items behind the obstruction would read as "missing"
-            # and could be falsely completed — touch nothing, retry later.
-            return {"ok": True, "changed": True, "obstructed": True, **base}
+            if s["obstruction_guard"]:
+                # Someone/something is blocking a board (presence lag, guest,
+                # chair). Items behind the obstruction would read as "missing"
+                # and could be falsely completed — touch nothing, retry later.
+                return {"ok": True, "changed": True, "obstructed": True, **base}
+            base["obstructed_ignored"] = True
         result = self.reconcile(seen, apply=not dry)
         if not dry and not result["failed"]:
             # A failed HA push means an item is not yet in Todoist; keeping
@@ -424,18 +524,26 @@ class Syncer:
 
     def tick(self) -> None:
         """One 30s beat of the main loop: scan when the interval has elapsed
-        and the presence gate allows. Split out of main() so it's testable."""
+        and the gates allow. Split out of main() so it's testable."""
         self.loop_beat = time.time()
-        if time.time() - self.last_scan_t < self.cfg.interval_s:
+        s = self.settings
+        if time.time() - self.last_scan_t < s["interval_s"]:
             return
-        if not self.cfg.scan_when_home and not self.away():
+        if not s["enabled"]:
+            self.last_scan_t = time.time()
+            self._gate_skip("disabled")
+            return
+        if s["presence_gate"] and not self.away():
             self.last_scan_t = time.time()  # re-check one interval later
-            self.counters["skips_home"] += 1
-            self.gate = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                         "t": round(time.time(), 1), "reason": "home"}
-            self._record({"type": "skip", "reason": "home"})
+            self._gate_skip("home")
             return
         self.scan(trigger="interval")
+
+    def _gate_skip(self, reason: str) -> None:
+        self.counters["skips_home" if reason == "home" else "skips_off"] += 1
+        self.gate = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                     "t": round(time.time(), 1), "reason": reason}
+        self._record({"type": "skip", "reason": reason})
 
     # -- dashboard --------------------------------------------------------
     def presence_state(self) -> Optional[str]:
@@ -458,11 +566,13 @@ class Syncer:
             "started_at": self.started_at,
             "scanning": self.scanning,
             "loop_beat_age_s": round(now - self.loop_beat),
-            "next_due_s": max(0, round(self.last_scan_t + cfg.interval_s - now)),
+            "next_due_s": max(0, round(self.last_scan_t + self.settings["interval_s"] - now)),
             "presence": {"entity": cfg.presence_entity, "state": state,
                          "away": not cfg.presence_entity or state != "home",
-                         "gates_scans": bool(cfg.presence_entity) and not cfg.scan_when_home},
+                         "gates_scans": bool(cfg.presence_entity)
+                                        and self.settings["presence_gate"]},
             "gate": self.gate,
+            "settings": dict(self.settings),
             "items": self.items_view,
             "last": self.last_result,
             "history": self.history,
@@ -534,6 +644,13 @@ ul.items li:first-child{border-top:0}
   padding:1px 8px;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
 .chip .dot{width:7px;height:7px}
 .empty{color:var(--muted);font-size:13px}
+.setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 22px}
+.setrow{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:6px 0;border-top:1px solid var(--grid);font-size:13px}
+.setrow label{color:var(--ink2)}
+input[type=checkbox]{width:16px;height:16px;accent-color:var(--series);margin:0}
+input[type=number],select{font:inherit;font-size:13px;color:var(--ink);background:var(--page);
+  border:1px solid var(--border);border-radius:6px;padding:3px 6px;width:82px}
 img#crop{display:block;width:100%;border-radius:8px;border:1px solid var(--border)}
 #chartwrap{position:relative}
 svg{display:block;width:100%;height:auto}
@@ -573,6 +690,10 @@ footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
   <section class="card"><h2>Work board</h2><ul class="items" id="list-work"></ul></section>
   <section class="card"><h2>Personal board</h2><ul class="items" id="list-personal"></ul></section>
 </div>
+
+<section class="card"><h2>Controls <small>changes apply immediately and persist</small></h2>
+  <div id="settings" class="setgrid"></div>
+</section>
 
 <section class="card"><h2>Latest board photo <small id="crop-cap"></small></h2>
   <img id="crop" alt="Cropped whiteboard snapshot" hidden>
@@ -618,21 +739,83 @@ const tstr = (t) => { const d = new Date(t * 1000);
 const who = () => ((st.presence.entity || '').replace('person.', '').split('_')[0] || 'you');
 
 function outcome(r) {
-  if (r.type === 'skip') return 'skipped — ' + who() + ' was home';
+  if (r.type === 'settings') return 'settings: ' + Object.entries(r.changed || {})
+    .map(([k, v]) => k + '=' + v).join(', ');
+  if (r.type === 'skip') return r.reason === 'home'
+    ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
   if (r.obstructed) return 'board obstructed — left alone';
   if (r.changed === false) return 'no change';
   const a = (r.added || []).length, c = (r.completed || []).length;
   let s = r.dry ? 'dry run: would add ' + a + ', complete ' + c
                 : a + ' added, ' + c + ' completed';
+  if (r.obstructed_ignored) s += ' (obstruction ignored)';
   if (r.failed) s += ' (' + r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry)';
   return s;
 }
 function kind(r) {
-  if (r.type === 'skip' || r.changed === false) return 'muted';
+  if (r.type === 'skip' || r.type === 'settings' || r.changed === false) return 'muted';
   if (r.error) return 'crit';
-  if (r.failed || r.obstructed) return 'warn';
+  if (r.failed || r.obstructed || r.obstructed_ignored) return 'warn';
   return 'good';
+}
+
+const SETTINGS_UI = [
+  ['enabled', 'bool', 'Scheduled scans'],
+  ['presence_gate', 'bool', 'Only scan while away'],
+  ['change_detection', 'bool', 'Skip unchanged frames'],
+  ['obstruction_guard', 'bool', 'Skip when obstructed'],
+  ['enhance', 'bool', 'Enhance photo (contrast+sharpen)'],
+  ['interval_s', 'num', 'Scan interval (s)', { min: 60, max: 86400, step: 60 }],
+  ['change_threshold', 'num', 'Change threshold', { min: 0.1, max: 50, step: 0.5 }],
+  ['missing_to_complete', 'num', 'Misses to complete', { min: 1, max: 10, step: 1 }],
+  ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
+  ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
+  ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],
+  ['capture_format', 'sel', 'Image format to model', [['jpeg', 'JPEG'], ['png', 'PNG']]],
+];
+let settingsBuilt = false;
+function buildSettings() {
+  const host = $('settings');
+  for (const [key, type, label, opt] of SETTINGS_UI) {
+    const row = el('div', 'setrow');
+    const lab = el('label', null, label); lab.htmlFor = 'set-' + key;
+    row.appendChild(lab);
+    let inp;
+    if (type === 'bool') { inp = el('input'); inp.type = 'checkbox'; }
+    else if (type === 'num') { inp = el('input'); inp.type = 'number';
+      inp.min = opt.min; inp.max = opt.max; inp.step = opt.step; }
+    else { inp = el('select');
+      for (const [v, l] of opt) { const o = el('option', null, l); o.value = v; inp.appendChild(o); } }
+    inp.id = 'set-' + key;
+    inp.addEventListener('change', async () => {
+      let val;
+      if (type === 'bool') val = inp.checked;
+      else if (type === 'num') val = Number(inp.value);
+      else val = type === 'sel' && key === 'upscale' ? Number(inp.value) : inp.value;
+      try {
+        const r = await fetch('/api/settings', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ [key]: val }) });
+        const j = await r.json();
+        const rej = j.rejected && j.rejected[key];
+        $('note').textContent = rej ? label + ': ' + rej
+          : Object.keys(j.applied || {}).length ? 'Saved: ' + label : '';
+      } catch (e) { $('note').textContent = 'Save failed: ' + e; }
+      refresh();
+    });
+    row.appendChild(inp); host.appendChild(row);
+  }
+  settingsBuilt = true;
+}
+function syncSettings() {
+  if (!settingsBuilt) buildSettings();
+  for (const [key, type] of SETTINGS_UI) {
+    const inp = $('set-' + key);
+    if (document.activeElement === inp) continue;
+    if (type === 'bool') inp.checked = !!st.settings[key];
+    else inp.value = String(st.settings[key]);
+  }
 }
 const KINDCOLOR = { good: 'var(--good)', warn: 'var(--warn)', crit: 'var(--crit)', muted: 'var(--muted)' };
 
@@ -645,19 +828,22 @@ function render() {
 
   if (stalled) pill('crit', 'Scan loop stalled — restart the container');
   else if (st.scanning) pill('busy', 'Scanning now…');
+  else if (!st.settings.enabled) pill('pause', 'Scheduled scans off');
   else if (last && last.error) pill('warn', 'Last scan failed — retrying on schedule');
   else if (last && last.failed) pill('warn', 'HA push failed — will retry');
   else if (p.gates_scans && !p.away) pill('pause', 'Paused — ' + who() + ' is home');
   else pill('good', 'Watching the boards');
 
   $('t-state').textContent = stalled ? 'Stalled' : st.scanning ? 'Scanning' :
-    (p.gates_scans && !p.away) ? 'Paused' : 'Active';
+    !st.settings.enabled ? 'Off' : (p.gates_scans && !p.away) ? 'Paused' : 'Active';
   $('t-state-sub').textContent = p.entity
     ? who() + ' is ' + (p.state === null ? 'unknown' : p.state === 'home' ? 'home' : 'away')
     : 'no presence gate';
 
-  $('t-next-label').textContent = (p.gates_scans && !p.away) ? 'Next presence check' : 'Next scan';
-  $('t-next-sub').textContent = 'every ' + Math.round(st.config.interval_s / 60) + ' min while away';
+  $('t-next-label').textContent = !st.settings.enabled ? 'Next enabled check'
+    : (p.gates_scans && !p.away) ? 'Next presence check' : 'Next scan';
+  $('t-next-sub').textContent = 'every ' + Math.round(st.settings.interval_s / 60) + ' min' +
+    (st.settings.presence_gate ? ' while away' : '');
 
   const items = st.items || [];
   const w = items.filter((i) => i.board === 'work').length;
@@ -678,7 +864,7 @@ function render() {
         const d = el('span', 'dot'); d.style.background = 'var(--serious)';
         chip.appendChild(d);
         chip.appendChild(document.createTextNode(
-          'missing ' + it.missing + '/' + st.config.missing_to_complete));
+          'missing ' + it.missing + '/' + st.settings.missing_to_complete));
         li.appendChild(chip);
       }
       ul.appendChild(li);
@@ -691,16 +877,19 @@ function render() {
     $('crop-cap').textContent = 'captured ' + ago(st.crop_t);
   }
 
-  chart(); table();
+  syncSettings(); chart(); table();
 
-  const c = st.counters, cfg = st.config;
+  const c = st.counters, cfg = st.config, set = st.settings;
   $('counters').textContent = 'since start: ' + c.scans + ' scans · ' + c.changed +
     ' processed · ' + c.unchanged + ' unchanged · ' + c.obstructed + ' obstructed · ' +
-    c.errors + ' errors · ' + c.skips_home + ' home-skips';
+    c.errors + ' errors · ' + c.skips_home + ' home-skips · ' + c.skips_off + ' off-skips';
   $('meta').textContent = 'model ' + cfg.model + ' · crop region ' + cfg.region.join(',') +
-    ' · change threshold ' + cfg.change_threshold + ' · completes after ' +
-    cfg.missing_to_complete + ' misses · Todoist project "' + cfg.todoist_project +
-    '" via ' + cfg.todo_entity + ' · service up since ' + st.started_at +
+    ' · photo: ' + set.capture_frames + ' frames stacked, ' + set.capture_format +
+    (set.capture_format === 'jpeg' ? ' q' + set.capture_quality : '') +
+    (set.upscale > 1 ? ', ' + set.upscale + 'x upscale' : '') +
+    (set.enhance ? ', enhanced' : '') +
+    ' · Todoist project "' + cfg.todoist_project + '" via ' + cfg.todo_entity +
+    ' · service up since ' + st.started_at +
     ' · tasks this session: ' + c.added + ' added, ' + c.completed + ' completed';
   countdown();
 }
@@ -854,7 +1043,7 @@ def serve_http(syncer: Syncer) -> None:
                 # A stale loop beat means the scan loop is dead or stuck; the
                 # longest legit gap is one interval plus the 600s model timeout.
                 age = time.time() - syncer.loop_beat
-                stalled = age > syncer.cfg.interval_s + 900
+                stalled = age > syncer.settings["interval_s"] + 900
                 self._json(500 if stalled else 200,
                            {"status": "loop stalled" if stalled else "ok",
                             "loop_beat_age_s": round(age)})
@@ -880,6 +1069,16 @@ def serve_http(syncer: Syncer) -> None:
 
             if url.path == "/scan":
                 self._json(200, syncer.scan(force=flag("force"), dry=flag("dry")))
+            elif url.path == "/api/settings":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    patch = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(patch, dict):
+                        raise ValueError("want a JSON object of settings")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    self._json(400, {"error": f"bad body: {exc}"})
+                    return
+                self._json(200, syncer.update_settings(patch))
             else:
                 self._json(404, {"error": "not found"})
 

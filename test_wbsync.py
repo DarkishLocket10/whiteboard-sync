@@ -194,6 +194,68 @@ def test_scan_survives_unexpected_errors(tmp_path):
     assert s.counters["errors"] == 1
 
 
+def test_settings_validate_persist_and_reload(tmp_path):
+    s = make_syncer(tmp_path)
+    out = s.update_settings({"interval_s": 300, "capture_frames": 999,
+                             "capture_format": "png", "bogus": 1})
+    assert out["applied"] == {"interval_s": 300, "capture_format": "png"}
+    assert "out of range" in out["rejected"]["capture_frames"]
+    assert out["rejected"]["bogus"] == "unknown setting"
+    reloaded = make_syncer(tmp_path)
+    assert reloaded.settings["interval_s"] == 300
+    assert reloaded.settings["capture_format"] == "png"
+    assert s.history[-1]["type"] == "settings"
+
+
+def test_presence_gate_toggle_scans_while_home(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reader = FixedReader({"obstructed": False, "work": [], "personal": []})
+    fake_fetch(s)
+    s.ha.presence = "home"
+    s.update_settings({"presence_gate": False})
+    s.tick()
+    assert s.counters["scans"] == 1 and s.counters["skips_home"] == 0
+
+
+def test_disabled_toggle_skips_all_scans(tmp_path):
+    s = make_syncer(tmp_path)  # away per default FakeHA, but disabled wins
+    s.update_settings({"enabled": False})
+    s.tick()
+    assert s.counters["scans"] == 0 and s.counters["skips_off"] == 1
+    assert s.history[-1] == {"type": "skip", "reason": "disabled",
+                             "at": s.history[-1]["at"], "t": s.history[-1]["t"]}
+
+
+def test_obstruction_guard_toggle(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["existing"], "personal": []})
+    s.reader = FixedReader({"obstructed": True, "work": [], "personal": []})
+    fake_fetch(s)
+    s.ha.calls.clear()
+
+    result = s.scan(force=True)             # guard on: reconcile untouched
+    assert result["obstructed"] is True and s.ha.calls == []
+
+    s.update_settings({"obstruction_guard": False, "missing_to_complete": 1})
+    result = s.scan(force=True)             # guard off: reconcile proceeds
+    assert result["obstructed_ignored"] is True
+    assert result["completed"] == ["existing"]
+
+
+def test_change_detection_toggle_forces_reads(tmp_path):
+    import numpy as np
+
+    s = make_syncer(tmp_path)
+    s.reader = FixedReader({"obstructed": False, "work": [], "personal": []})
+    fake_fetch(s)
+    s.scan(force=True)                       # establishes the baseline
+    result = s.scan()                        # identical frame: skipped
+    assert result["changed"] is False
+    s.update_settings({"change_detection": False})
+    result = s.scan()                        # toggle off: always read
+    assert result["changed"] is True
+
+
 def test_boards_are_reconciled_independently(tmp_path):
     s = make_syncer(tmp_path)
     # Same text on both boards must be two distinct items
