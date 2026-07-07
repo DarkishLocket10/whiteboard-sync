@@ -74,24 +74,29 @@ SETTING_BOUNDS = {
 READ_PROMPT = """\
 This photo shows two whiteboards side by side.
 The LEFT board holds WORK to-do items. The RIGHT board holds PERSONAL to-do items.
-First, set "obstructed" to true if a person, chair, or any object blocks or
-covers ANY part of either whiteboard, or if a board is not fully visible in
-the photo — otherwise false.
-Then transcribe every item that is still OPEN: its checkbox is empty (not
+Transcribe every to-do item that is still OPEN: its checkbox is empty (not
 ticked) and it is not crossed out or erased. Skip completed items, headings,
 name tags, stickers, photos, and anything that is not a list item.
+A person or object may hide part of a board. Still transcribe every open
+item you can actually read — NEVER return an empty list just because a board
+is partially hidden. Read around the blockage.
+After transcribing, set "work_obstructed" to true if a person, chair, or any
+object hides ANY part of the LEFT board, and "personal_obstructed" to true if
+anything hides ANY part of the RIGHT board — otherwise false.
 Write each item as a short task phrase without bullet or checkbox characters,
-fixing obvious handwriting artifacts. If a board is empty or unreadable,
-return an empty list for it."""
+fixing obvious handwriting artifacts."""
 
 READ_SCHEMA = {
     "type": "object",
     "properties": {
-        "obstructed": {"type": "boolean"},
+        # transcriptions FIRST: the obstruction judgment must not talk the
+        # model out of reading the items it can see
         "work": {"type": "array", "items": {"type": "string"}},
         "personal": {"type": "array", "items": {"type": "string"}},
+        "work_obstructed": {"type": "boolean"},
+        "personal_obstructed": {"type": "boolean"},
     },
-    "required": ["obstructed", "work", "personal"],
+    "required": ["work", "personal", "work_obstructed", "personal_obstructed"],
     "additionalProperties": False,
 }
 
@@ -385,7 +390,16 @@ class Syncer:
         push adds/completions to HA and persist; with ``apply=False`` (dry
         run) just report what WOULD happen, touching nothing.
         Returns {'added': [...], 'completed': [...]} of item texts plus a
-        'failed' count of HA calls that didn't land (they retry next scan)."""
+        'failed' count of HA calls that didn't land (they retry next scan)
+        and the 'protected' boards.
+
+        A board flagged obstructed (and the obstruction guard on) is
+        PROTECTED: its visible new items are still added, but nothing on it
+        is counted missing — items hidden behind a person must never be
+        completed. The other board reconciles normally."""
+        guard = self.settings["obstruction_guard"]
+        protected = [b for b in ("work", "personal")
+                     if guard and seen.get(f"{b}_obstructed")]
         added, completed, failed = [], [], 0
         for board in ("work", "personal"):
             seen_texts = [t.strip() for t in seen.get(board, []) if t.strip()]
@@ -411,6 +425,8 @@ class Syncer:
                 else:
                     failed += 1
 
+            if board in protected:
+                continue  # completions deferred until this board is clear
             for item in known:
                 if item["text"] in matched_known:
                     if apply:
@@ -434,7 +450,8 @@ class Syncer:
         if apply:
             write_json_atomic(self._state_path, self.state)
             self.items_view = [dict(i) for i in self.state["items"]]
-        return {"added": added, "completed": completed, "failed": failed}
+        return {"added": added, "completed": completed, "failed": failed,
+                "protected": protected}
 
     # -- scan -------------------------------------------------------------
     def scan(self, force: bool = False, dry: bool = False, trigger: str = "manual") -> dict:
@@ -469,13 +486,9 @@ class Syncer:
         except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
             log.warning("board read failed: %s", exc)
             return {"ok": False, "error": f"read failed: {exc}", **base}
-        if seen.get("obstructed"):
-            if s["obstruction_guard"]:
-                # Someone/something is blocking a board (presence lag, guest,
-                # chair). Items behind the obstruction would read as "missing"
-                # and could be falsely completed — touch nothing, retry later.
-                return {"ok": True, "changed": True, "obstructed": True, **base}
-            base["obstructed_ignored"] = True
+        blocked = [b for b in ("work", "personal") if seen.get(f"{b}_obstructed")]
+        if blocked:
+            base["obstructed"] = blocked
         result = self.reconcile(seen, apply=not dry)
         if not dry and not result["failed"]:
             # A failed HA push means an item is not yet in Todoist; keeping
@@ -491,12 +504,12 @@ class Syncer:
         c["scans"] += 1
         if not result.get("ok"):
             c["errors"] += 1
-        elif result.get("obstructed"):
-            c["obstructed"] += 1
         elif not result.get("changed"):
             c["unchanged"] += 1
         else:
             c["changed"] += 1
+        if result.get("obstructed"):
+            c["obstructed"] += 1
         if not result.get("dry"):
             c["added"] += len(result.get("added", []))
             c["completed"] += len(result.get("completed", []))
@@ -744,12 +757,14 @@ function outcome(r) {
   if (r.type === 'skip') return r.reason === 'home'
     ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
-  if (r.obstructed) return 'board obstructed — left alone';
+  if (r.obstructed === true) return 'board obstructed — left alone';  // legacy records
   if (r.changed === false) return 'no change';
   const a = (r.added || []).length, c = (r.completed || []).length;
   let s = r.dry ? 'dry run: would add ' + a + ', complete ' + c
                 : a + ' added, ' + c + ' completed';
-  if (r.obstructed_ignored) s += ' (obstruction ignored)';
+  if (Array.isArray(r.obstructed) && r.obstructed.length)
+    s += ' (' + r.obstructed.join(' + ') + ' board blocked — completions deferred)';
+  if (r.obstructed_ignored) s += ' (obstruction ignored)';               // legacy
   if (r.failed) s += ' (' + r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry)';
   return s;
 }
@@ -831,6 +846,8 @@ function render() {
   else if (!st.settings.enabled) pill('pause', 'Scheduled scans off');
   else if (last && last.error) pill('warn', 'Last scan failed — retrying on schedule');
   else if (last && last.failed) pill('warn', 'HA push failed — will retry');
+  else if (last && Array.isArray(last.obstructed) && last.obstructed.length)
+    pill('warn', last.obstructed.join(' + ') + ' board blocked — completions deferred');
   else if (p.gates_scans && !p.away) pill('pause', 'Paused — ' + who() + ' is home');
   else pill('good', 'Watching the boards');
 

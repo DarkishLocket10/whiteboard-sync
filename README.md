@@ -62,8 +62,8 @@ Stage by stage:
 3. **Read.** The crop goes to a local Ollama vision model
    (`qwen3-vl:8b-instruct` by default) with a JSON-schema-constrained prompt:
    transcribe every item that is still open (checkbox empty, not crossed
-   out), skip everything else, and say whether anything **obstructs** the
-   boards.
+   out) — including items on a partially blocked board — skip everything
+   else, and flag **per board** whether anything obstructs it.
 
 4. **Reconcile.** OCR of handwriting wobbles between scans, so matching is
    fuzzy (`difflib` ratio ≥ 0.8) and the *first* transcription of an item is
@@ -74,8 +74,10 @@ Stage by stage:
    with `status: completed`.
 
 5. **Guard rails.**
-   - If a person or chair blocks a board, the model flags it and the scan
-     changes nothing — items hidden behind you must not be "completed."
+   - If a person or chair blocks part of a board, that board's visible new
+     items still sync, but nothing on it is counted missing — items hidden
+     behind you must not be "completed." The other board reconciles
+     normally, so sitting in front of one board never freezes the other.
    - If a Home Assistant call fails, the change-detection baseline is *not*
      advanced, so the next scan re-reads the board and retries the push.
      Nothing is silently lost.
@@ -188,11 +190,11 @@ Environment variables (in `.env`) set the **defaults**:
 
 ## Troubleshooting
 
-- **Every scan says "board obstructed."** Someone (you?) is between the
-  camera and a board, or a chair drifted into frame. Check the photo card on
-  the dashboard — the model is probably right. This is the guard working:
-  hidden items would otherwise be falsely completed. It re-checks every
-  interval and processes as soon as the view clears.
+- **History says "board blocked — completions deferred."** Someone (you?)
+  is between the camera and that board, or a chair drifted into frame. Check
+  the photo card — the model is probably right. Visible items still sync;
+  only completions on the blocked board wait until the view clears. If it
+  never clears, something is parked in front of the board.
 - **Nothing has scanned for hours.** Look at the status pill — you're
   probably home, and scans are presence-gated. The history shows each skip.
   Toggle "Only scan while away" off if you want scans regardless.

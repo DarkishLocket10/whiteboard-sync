@@ -113,24 +113,28 @@ def test_state_persists_across_restarts(tmp_path):
     assert reloaded.state["items"] == [{"text": "Fix dashboard", "board": "work", "missing": 0}]
 
 
-def test_obstructed_scan_touches_nothing(tmp_path):
-    import numpy as np
-
+def test_obstructed_board_defers_completions_but_still_adds(tmp_path):
     s = make_syncer(tmp_path)
-    s.reconcile({"work": ["Fix dashboard"], "personal": []})
+    s.reconcile({"work": ["Fix dashboard"], "personal": ["do laundry"]})
     s.ha.calls.clear()
 
-    class ObstructedReader:
-        def read(self, jpeg):
-            return {"obstructed": True, "work": [], "personal": []}
-
-    s.reader = ObstructedReader()
-    s._fetch_crop = lambda: (b"jpeg", np.zeros((5, 5), dtype=np.float32))
+    # A person blocks the WORK board; one new item is still readable there,
+    # and the PERSONAL board is clear with its item erased.
+    s.reader = FixedReader({"work": ["New visible item"], "personal": [],
+                            "work_obstructed": True, "personal_obstructed": False})
+    fake_fetch(s)
     result = s.scan(force=True)
-    assert result["obstructed"] is True
-    assert s.ha.calls == []                          # no completions fired
-    assert s.state["items"][0]["missing"] == 0       # no miss counted
-    assert not (tmp_path / "baseline.npy").exists()  # baseline untouched
+
+    assert result["obstructed"] == ["work"]
+    assert result["protected"] == ["work"]
+    assert result["added"] == ["New visible item"]   # visible adds still land
+    by_text = {i["text"]: i for i in s.state["items"]}
+    assert by_text["Fix dashboard"]["missing"] == 0  # hidden: NOT counted missing
+    assert by_text["do laundry"]["missing"] == 1     # clear board reconciles
+
+    result = s.scan(force=True)                      # second miss on clear board
+    assert result["completed"] == ["do laundry"]
+    assert by_text["Fix dashboard"]["missing"] == 0  # still protected
 
 
 def test_dry_run_touches_nothing(tmp_path):
@@ -229,16 +233,19 @@ def test_disabled_toggle_skips_all_scans(tmp_path):
 def test_obstruction_guard_toggle(tmp_path):
     s = make_syncer(tmp_path)
     s.reconcile({"work": ["existing"], "personal": []})
-    s.reader = FixedReader({"obstructed": True, "work": [], "personal": []})
+    s.reader = FixedReader({"work": [], "personal": [],
+                            "work_obstructed": True, "personal_obstructed": False})
     fake_fetch(s)
     s.ha.calls.clear()
+    s.update_settings({"missing_to_complete": 1})
 
-    result = s.scan(force=True)             # guard on: reconcile untouched
-    assert result["obstructed"] is True and s.ha.calls == []
+    result = s.scan(force=True)             # guard on: work board protected
+    assert result["obstructed"] == ["work"] and result["completed"] == []
+    assert s.ha.calls == []
 
-    s.update_settings({"obstruction_guard": False, "missing_to_complete": 1})
-    result = s.scan(force=True)             # guard off: reconcile proceeds
-    assert result["obstructed_ignored"] is True
+    s.update_settings({"obstruction_guard": False})
+    result = s.scan(force=True)             # guard off: flags ignored entirely
+    assert result["protected"] == []
     assert result["completed"] == ["existing"]
 
 
