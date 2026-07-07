@@ -290,10 +290,13 @@ def test_boards_are_reconciled_independently(tmp_path):
 
 def test_new_tasks_get_due_today_unless_disabled(tmp_path):
     s = make_syncer(tmp_path)
-    s.reconcile({"work": ["with date"], "personal": []})
+    # NB: the two task names must be fuzzy-DISSIMILAR or the second read
+    # matches the first item and never creates a task
+    s.reconcile({"work": ["buy milk"], "personal": []})
     assert s.ha.calls[-1][2]["due_date_string"] == "today"
     s.update_settings({"due_today": False})
-    s.reconcile({"work": ["without date"], "personal": []})
+    s.reconcile({"work": ["call the plumber"], "personal": []})
+    assert s.ha.calls[-1][2]["content"] == "call the plumber"
     assert "due_date_string" not in s.ha.calls[-1][2]
 
 
