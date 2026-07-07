@@ -26,8 +26,20 @@ kinect-knob (/api/snapshot, 1080p) ──► crop boards ──► changed since
 3. `docker compose up -d --build`
 4. Test: `curl -X POST 'localhost:8430/scan?force=1'` and check Todoist.
 
-## Endpoints (port 8430)
+## Dashboard & endpoints (port 8430)
 
-- `GET /healthz` — liveness
+Open `http://<host>:8430/` for the live dashboard: sync state and presence
+gate, tracked items per board, the latest camera crop, change scores vs the
+threshold (useful for tuning `WB_CHANGE_THRESHOLD`), and a history of every
+scan and skip. Buttons trigger a forced or dry-run scan.
+
+- `GET /` — dashboard
+- `GET /healthz` — liveness (returns 500 once the scan loop has stalled)
 - `GET /state` — tracked items + last scan result
-- `POST /scan` (`?force=1` to bypass change detection) — scan now
+- `GET /api/status` — everything the dashboard shows, as JSON
+- `GET /crop.jpg` — most recent cropped board photo
+- `POST /scan` (`?force=1` bypass change detection, `?dry=1` report only,
+  touch nothing) — scan now
+
+Scan history persists in `data/history.jsonl`; the latest crop in
+`data/last_crop.jpg`.

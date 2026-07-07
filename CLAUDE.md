@@ -17,7 +17,9 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
 2. Commit and push.
 3. `docker compose up -d --build` (builds in seconds).
 4. Verify: `curl localhost:8430/healthz`, `curl localhost:8430/state`,
-   force a scan with `curl -X POST 'localhost:8430/scan?force=1'`.
+   force a scan with `curl -X POST 'localhost:8430/scan?force=1'`
+   (`&dry=1` to preview without touching Todoist), or open the dashboard
+   at `http://<host>:8430/`.
 
 ## Sharp edges
 
@@ -27,7 +29,11 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   to the Todoist task summaries or completions can't find their task. Don't
   "clean up" state by hand while tasks are open.
 - The change-detection baseline (`data/baseline.npy`) only updates after a
-  *processed* read, so a failed model call retries on the next interval.
+  *processed* read whose HA pushes ALL succeeded, so a failed model call or
+  a failed Todoist push retries on the next interval.
+- Dashboard state lives in `data/history.jsonl` (scan/skip records, trimmed
+  to the last 400 on boot) and `data/last_crop.jpg`. Safe to delete; the
+  dashboard just loses its history.
 - kinect-knob owns the camera (libfreenect2 is single-process); this service
   must never try to open the Kinect itself — always go through the snapshot
   endpoint. If snapshots 404, kinect-knob was probably restarted seconds ago

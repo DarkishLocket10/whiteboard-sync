@@ -9,13 +9,28 @@ from wbsync import Config, Syncer, fuzzy_match, parse_region
 class FakeHA:
     def __init__(self):
         self.calls = []
+        self.ok = True            # flip to False to simulate HA being down
+        self.presence = "not_home"
 
     def call(self, domain, service, data):
         self.calls.append((domain, service, data))
-        return True
+        return self.ok
 
     def state(self, entity):
-        return "not_home"
+        return self.presence
+
+
+class FixedReader:
+    def __init__(self, seen):
+        self.seen = seen
+
+    def read(self, jpeg):
+        return self.seen
+
+
+def fake_fetch(syncer):
+    import numpy as np
+    syncer._fetch_crop = lambda: (b"jpeg", np.zeros((5, 5), dtype=np.float32))
 
 
 def make_syncer(tmp_path, missing_to_complete=2):
@@ -129,6 +144,54 @@ def test_dry_run_touches_nothing(tmp_path):
     assert s.ha.calls == []                          # nothing pushed
     assert len(s.state["items"]) == 1                # state unchanged
     assert s.state["items"][0]["missing"] == 1       # counter unchanged
+
+
+def test_failed_ha_push_keeps_baseline_so_next_scan_retries(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reader = FixedReader({"obstructed": False, "work": ["new item"], "personal": []})
+    fake_fetch(s)
+    s.ha.ok = False  # HA down: the push fails
+    result = s.scan(force=True)
+    assert result["failed"] == 1 and result["added"] == []
+    # baseline untouched -> the change re-detects and the push retries
+    assert not (tmp_path / "baseline.npy").exists()
+    s.ha.ok = True
+    result = s.scan(force=True)
+    assert result["added"] == ["new item"]
+    assert (tmp_path / "baseline.npy").exists()
+
+
+def test_scan_history_is_recorded_and_survives_restart(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reader = FixedReader({"obstructed": False, "work": ["task"], "personal": []})
+    fake_fetch(s)
+    s.scan(force=True)
+    assert s.history[-1]["type"] == "scan"
+    assert s.history[-1]["added"] == ["task"]
+    assert "seen" not in s.history[-1]  # raw transcriptions stay out of history
+    reloaded = make_syncer(tmp_path)
+    assert reloaded.history[-1]["added"] == ["task"]
+
+
+def test_tick_skips_and_records_when_home(tmp_path):
+    s = make_syncer(tmp_path)  # reader=None: an actual scan attempt would error
+    s.ha.presence = "home"
+    s.tick()
+    assert s.counters["skips_home"] == 1
+    assert s.history[-1]["type"] == "skip" and s.history[-1]["reason"] == "home"
+    assert s.last_scan_t > 0  # re-check deferred one interval
+
+
+def test_scan_survives_unexpected_errors(tmp_path):
+    s = make_syncer(tmp_path)
+
+    def boom():
+        raise ValueError("boom")
+
+    s._fetch_crop = boom
+    result = s.scan(force=True)
+    assert result["ok"] is False and "boom" in result["error"]
+    assert s.counters["errors"] == 1
 
 
 def test_boards_are_reconciled_independently(tmp_path):
