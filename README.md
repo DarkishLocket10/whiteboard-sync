@@ -37,8 +37,9 @@ kinect-knob (:8420)                         whiteboard-sync (:8430)
                                                   │ {"work": [...], "personal": [...]}
                                                   ▼
                                      fuzzy diff vs data/state.json
-                                      │ new item      → todoist.new_task
-                                      │ missing twice → todo.update_item (completed)
+                                      │ new item        → todoist.new_task
+                                      │ checkbox ticked → todo.update_item (completed)
+                                      │ missing twice   → todo.update_item (completed)
                                       ▼
                                         Home Assistant ──► Todoist
 ```
@@ -60,18 +61,24 @@ Stage by stage:
    model is ever invoked.
 
 3. **Read.** The crop goes to a local Ollama vision model
-   (`qwen3-vl:8b-instruct` by default) with a JSON-schema-constrained prompt:
-   transcribe every item that is still open (checkbox empty, not crossed
-   out) — including items on a partially blocked board — skip everything
-   else, and flag **per board** whether anything obstructs it.
+   (`qwen3-vl:8b-instruct` by default) with a JSON-schema-constrained prompt
+   that sorts every readable item into **open** (checkbox empty) or **done**
+   (checkbox ticked/X'd/filled, or text struck through) per board — including
+   items on a partially blocked board — and flags **per board** whether
+   anything obstructs it.
 
 4. **Reconcile.** OCR of handwriting wobbles between scans, so matching is
    fuzzy (`difflib` ratio ≥ 0.8) and the *first* transcription of an item is
    kept as canonical — it must stay byte-identical to the Todoist task
-   summary, or the completion call couldn't find its task later. New items
-   fire `todoist.new_task`; items that have been missing for **two
-   consecutive scans** (one bad read is forgiven) fire `todo.update_item`
-   with `status: completed`.
+   summary, or the completion call couldn't find its task later. New open
+   items fire `todoist.new_task`. Completions have two signals:
+   - **A ticked checkbox** is a positive, directly-readable signal: the task
+     completes on the next scan (tunable). You don't have to erase anything —
+     the ticked item stays tracked as "done" while it remains on the board,
+     so a later misread of its tick can never re-create the task. Items that
+     *first* appear already ticked never become tasks at all.
+   - **Absence** (erased) completes after **two consecutive misses** (one
+     bad read is forgiven), and only on an unobstructed board.
 
 5. **Guard rails.**
    - If a person or chair blocks part of a board, that board's visible new
@@ -153,7 +160,8 @@ Environment variables (in `.env`) set the **defaults**:
 | `WB_TODOIST_PROJECT` | `Inbox` | Project new tasks land in |
 | `WB_INTERVAL_S` | `900` | Seconds between scans / presence checks |
 | `WB_CHANGE_THRESHOLD` | `4.0` | Mean pixel diff that counts as "changed" |
-| `WB_MISSING_TO_COMPLETE` | `2` | Consecutive misses before completing |
+| `WB_MISSING_TO_COMPLETE` | `2` | Consecutive misses (erased) before completing |
+| `WB_TICKED_TO_COMPLETE` | `1` | Consecutive ticked sightings before completing |
 | `WB_SCAN_WHEN_HOME` | `false` | `true` disables the presence gate |
 | `WB_DATA_DIR` | `/data` | Persistence directory (volume-mounted) |
 
@@ -163,8 +171,9 @@ Environment variables (in `.env`) set the **defaults**:
 
 `enabled` · `presence_gate` · `change_detection` · `obstruction_guard` ·
 `enhance` · `interval_s` · `change_threshold` · `missing_to_complete` ·
-`capture_frames` (1–32 stacked per photo) · `capture_quality` ·
-`capture_format` (`jpeg`/`png` to the model) · `upscale` (1–2×)
+`ticked_to_complete` · `capture_frames` (1–32 stacked per photo) ·
+`capture_quality` · `capture_format` (`jpeg`/`png` to the model) ·
+`upscale` (1–2×)
 
 ## HTTP API (port 8430)
 

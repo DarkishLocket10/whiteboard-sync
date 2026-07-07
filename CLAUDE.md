@@ -27,7 +27,10 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   pulled: `docker exec ollama ollama pull qwen3-vl:8b-instruct`.
 - `data/state.json` item texts are canonical — they must stay byte-identical
   to the Todoist task summaries or completions can't find their task. Don't
-  "clean up" state by hand while tasks are open.
+  "clean up" state by hand while tasks are open. Items carry a `status`:
+  "open" (task live in Todoist) or "done" (task completed but the ticked
+  item is still physically on the board — kept so tick misreads can't
+  re-create the task; purged after it's erased).
 - The change-detection baseline (`data/baseline.npy`) only updates after a
   *processed* read whose HA pushes ALL succeeded, so a failed model call or
   a failed Todoist push retries on the next interval.

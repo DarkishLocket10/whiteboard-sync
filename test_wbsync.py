@@ -110,7 +110,17 @@ def test_state_persists_across_restarts(tmp_path):
     s = make_syncer(tmp_path)
     s.reconcile({"work": ["Fix dashboard"], "personal": []})
     reloaded = make_syncer(tmp_path)
-    assert reloaded.state["items"] == [{"text": "Fix dashboard", "board": "work", "missing": 0}]
+    assert reloaded.state["items"] == [{"text": "Fix dashboard", "board": "work",
+                                        "status": "open", "missing": 0, "ticked": 0}]
+
+
+def test_legacy_state_migrates_to_open_status(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps(
+        {"items": [{"text": "old", "board": "work", "missing": 1}]}))
+    s = make_syncer(tmp_path)
+    assert s.state["items"][0]["status"] == "open"
+    assert s.state["items"][0]["ticked"] == 0
+    assert s.state["items"][0]["missing"] == 1  # counter survives the migration
 
 
 def test_obstructed_board_defers_completions_but_still_adds(tmp_path):
@@ -274,4 +284,89 @@ def test_boards_are_reconciled_independently(tmp_path):
     s.reconcile({"work": [], "personal": ["call mom"]})
     completed = [c for c in s.ha.calls if c[1] == "update_item"]
     assert len(completed) == 1
-    assert s.state["items"] == [{"text": "call mom", "board": "personal", "missing": 0}]
+    assert s.state["items"] == [{"text": "call mom", "board": "personal",
+                                 "status": "open", "missing": 0, "ticked": 0}]
+
+
+def test_ticked_item_completes_and_stays_tracked_as_done(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["Fix dashboard"], "personal": []})
+    s.ha.calls.clear()
+
+    result = s.reconcile({"work": [], "work_done": ["Fix dashboard"], "personal": []})
+    assert result["completed"] == ["Fix dashboard"]  # one tick sighting is enough
+    assert s.ha.calls == [("todo", "update_item", {
+        "entity_id": "todo.inbox", "item": "Fix dashboard", "status": "completed",
+    })]
+    assert s.state["items"][0]["status"] == "done"   # kept while on the board
+
+    # Still ticked next scan: nothing fires again.
+    s.ha.calls.clear()
+    result = s.reconcile({"work": [], "work_done": ["Fix dashboard"], "personal": []})
+    assert result["completed"] == [] and s.ha.calls == []
+
+    # Tick MISREAD as open later: must not re-create the task.
+    result = s.reconcile({"work": ["Fix dashboard"], "personal": []})
+    assert result["added"] == [] and s.ha.calls == []
+    assert s.state["items"][0]["status"] == "done"
+
+
+def test_done_item_purges_after_erase_without_ha_call(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["Fix dashboard"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["Fix dashboard"], "personal": []})
+    s.ha.calls.clear()
+    s.reconcile({"work": [], "personal": []})        # erased: miss 1, still tracked
+    assert len(s.state["items"]) == 1
+    s.reconcile({"work": [], "personal": []})        # miss 2: purged silently
+    assert s.state["items"] == [] and s.ha.calls == []
+
+
+def test_item_first_seen_ticked_never_creates_a_task(tmp_path):
+    s = make_syncer(tmp_path)
+    result = s.reconcile({"work": [], "work_done": ["old finished thing"], "personal": []})
+    assert result["added"] == [] and s.ha.calls == []
+    assert s.state["items"][0]["status"] == "done"
+    # ...even when its tick is later misread as an open item
+    result = s.reconcile({"work": ["old finished thing"], "personal": []})
+    assert result["added"] == [] and s.ha.calls == []
+
+
+def test_ticked_to_complete_guard(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"ticked_to_complete": 2})
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    r1 = s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    assert r1["completed"] == [] and s.ha.calls == []
+    assert s.state["items"][0]["ticked"] == 1
+    r2 = s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    assert r2["completed"] == ["task"]
+    # a wobbly tick that reads open in between resets the streak
+    s.reconcile({"work": ["another"], "personal": []})
+    s.ha.calls.clear()
+    s.reconcile({"work": [], "work_done": ["another"], "personal": []})
+    s.reconcile({"work": ["another"], "personal": []})
+    assert s.state["items"][-1]["ticked"] == 0
+
+
+def test_tick_completes_even_on_obstructed_board(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    result = s.reconcile({"work": [], "work_done": ["task"], "personal": [],
+                          "work_obstructed": True, "personal_obstructed": False})
+    assert result["protected"] == ["work"]
+    # a readable tick is presence, not absence — the guard doesn't apply
+    assert result["completed"] == ["task"]
+
+
+def test_dry_run_reports_tick_completions_without_touching(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    preview = s.reconcile({"work": [], "work_done": ["task"], "personal": []},
+                          apply=False)
+    assert preview["completed"] == ["task"]
+    assert s.ha.calls == []
+    assert s.state["items"][0]["status"] == "open"   # untouched

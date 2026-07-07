@@ -9,9 +9,12 @@ into Todoist via Home Assistant:
 * LEFT board  -> work items,     tagged ["whiteboard", "work"]
 * RIGHT board -> personal items, tagged ["whiteboard", "personal"]
 * New item on a board            -> ``todoist.new_task`` into the Inbox
-* Item erased or checkbox ticked -> after it has been missing for
-  ``WB_MISSING_TO_COMPLETE`` consecutive scans, ``todo.update_item``
-  marks the Todoist task completed (the guard absorbs one bad OCR read)
+* Checkbox TICKED (check/X/fill) -> ``todo.update_item`` completes the task
+  after ``ticked_to_complete`` sightings (default 1); the item stays tracked
+  as "done" while it remains on the board so tick misreads can't re-add it
+* Item ERASED                    -> after it has been missing for
+  ``WB_MISSING_TO_COMPLETE`` consecutive scans, completed the same way
+  (the guard absorbs one bad OCR read)
 
 Scans run every ``WB_INTERVAL_S`` seconds, only while ``WB_PRESENCE_ENTITY``
 is away (that's also when nobody blocks the camera's view of the boards),
@@ -65,6 +68,7 @@ SETTING_BOUNDS = {
     "interval_s": (int, 60, 86400),
     "change_threshold": (float, 0.1, 50.0),
     "missing_to_complete": (int, 1, 10),
+    "ticked_to_complete": (int, 1, 10),  # tick sightings before completing
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
     "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
     "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
@@ -74,12 +78,17 @@ SETTING_BOUNDS = {
 READ_PROMPT = """\
 This photo shows two whiteboards side by side.
 The LEFT board holds WORK to-do items. The RIGHT board holds PERSONAL to-do items.
-Transcribe every to-do item that is still OPEN: its checkbox is empty (not
-ticked) and it is not crossed out or erased. Skip completed items, headings,
-name tags, stickers, photos, and anything that is not a list item.
-A person or object may hide part of a board. Still transcribe every open
-item you can actually read — NEVER return an empty list just because a board
-is partially hidden. Read around the blockage.
+Every to-do item has a small square checkbox drawn beside it.
+Sort every readable to-do item into one of two lists per board:
+- OPEN ("work" / "personal"): the checkbox is empty and the text is not
+  crossed out.
+- DONE ("work_done" / "personal_done"): the checkbox contains a check mark,
+  an X, or a scribble filling it, OR the item text is struck through.
+Skip headings, name tags, stickers, photos, and anything that is not a
+to-do list item. Erased items appear in neither list.
+A person or object may hide part of a board. Still transcribe every item you
+can actually read — NEVER return empty lists just because a board is
+partially hidden. Read around the blockage.
 After transcribing, set "work_obstructed" to true if a person, chair, or any
 object hides ANY part of the LEFT board, and "personal_obstructed" to true if
 anything hides ANY part of the RIGHT board — otherwise false.
@@ -92,11 +101,14 @@ READ_SCHEMA = {
         # transcriptions FIRST: the obstruction judgment must not talk the
         # model out of reading the items it can see
         "work": {"type": "array", "items": {"type": "string"}},
+        "work_done": {"type": "array", "items": {"type": "string"}},
         "personal": {"type": "array", "items": {"type": "string"}},
+        "personal_done": {"type": "array", "items": {"type": "string"}},
         "work_obstructed": {"type": "boolean"},
         "personal_obstructed": {"type": "boolean"},
     },
-    "required": ["work", "personal", "work_obstructed", "personal_obstructed"],
+    "required": ["work", "work_done", "personal", "personal_done",
+                 "work_obstructed", "personal_obstructed"],
     "additionalProperties": False,
 }
 
@@ -132,6 +144,7 @@ class Config:
     scan_when_home: bool
     model: str
     data_dir: Path
+    ticked_to_complete: int = 1
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -148,6 +161,7 @@ class Config:
             interval_s=int(env("WB_INTERVAL_S", "900")),
             change_threshold=float(env("WB_CHANGE_THRESHOLD", "4.0")),
             missing_to_complete=int(env("WB_MISSING_TO_COMPLETE", "2")),
+            ticked_to_complete=int(env("WB_TICKED_TO_COMPLETE", "1")),
             scan_when_home=env("WB_SCAN_WHEN_HOME", "false").lower() in ("1", "true", "yes"),
             model=env("WB_MODEL", "qwen3-vl:8b-instruct"),
             data_dir=Path(env("WB_DATA_DIR", "/data")),
@@ -242,9 +256,12 @@ class Syncer:
         self._baseline_path = cfg.data_dir / "baseline.npy"
         self._history_path = cfg.data_dir / "history.jsonl"
         self.crop_path = cfg.data_dir / "last_crop.jpg"
-        self.state: dict = {"items": []}  # [{text, board, missing}]
+        self.state: dict = {"items": []}  # [{text, board, status, missing, ticked}]
         if self._state_path.is_file():
             self.state = json.loads(self._state_path.read_text())
+        for item in self.state["items"]:  # migrate pre-checkmark state files
+            item.setdefault("status", "open")
+            item.setdefault("ticked", 0)
         # items_view is what HTTP threads serve: a snapshot swapped whole, so
         # a scan mutating self.state mid-serialisation can't tear a response.
         self.items_view: list[dict] = [dict(i) for i in self.state["items"]]
@@ -269,6 +286,7 @@ class Syncer:
             "interval_s": cfg.interval_s,
             "change_threshold": cfg.change_threshold,
             "missing_to_complete": cfg.missing_to_complete,
+            "ticked_to_complete": cfg.ticked_to_complete,
             "capture_frames": 8,
             "capture_quality": 92,
             "upscale": 1,
@@ -385,6 +403,13 @@ class Syncer:
         return float(np.abs(gray - baseline).mean())
 
     # -- reconciliation ---------------------------------------------------
+    def _complete_in_todoist(self, item: dict) -> bool:
+        return self.ha.call("todo", "update_item", {
+            "entity_id": self.cfg.todo_entity,
+            "item": item["text"],
+            "status": "completed",
+        })
+
     def reconcile(self, seen: dict, apply: bool = True) -> dict:
         """Diff OCR results against known state. With ``apply`` (the default),
         push adds/completions to HA and persist; with ``apply=False`` (dry
@@ -393,24 +418,37 @@ class Syncer:
         'failed' count of HA calls that didn't land (they retry next scan)
         and the 'protected' boards.
 
-        A board flagged obstructed (and the obstruction guard on) is
-        PROTECTED: its visible new items are still added, but nothing on it
-        is counted missing — items hidden behind a person must never be
-        completed. The other board reconciles normally."""
+        Completion signals, strongest first:
+
+        * A TICKED checkbox (the board's ``*_done`` list) is a positive,
+          directly-readable signal: the task completes after
+          ``ticked_to_complete`` consecutive sightings (default 1) — even on
+          an obstructed board. The item then stays tracked with status
+          "done" for as long as it remains on the board, so a later misread
+          of its tick can never re-create the task.
+        * ABSENCE (in neither list) means erased — but only on a clear
+          board. After ``missing_to_complete`` consecutive misses the task
+          completes and the item is dropped. On a PROTECTED board (flagged
+          obstructed while the guard is on) absence proves nothing: no miss
+          is counted, though visible new items are still added.
+        * Items first seen already ticked never create Todoist tasks; done
+          items are purged (no HA call) once they've been erased for
+          ``missing_to_complete`` scans."""
         guard = self.settings["obstruction_guard"]
         protected = [b for b in ("work", "personal")
                      if guard and seen.get(f"{b}_obstructed")]
         added, completed, failed = [], [], 0
         for board in ("work", "personal"):
-            seen_texts = [t.strip() for t in seen.get(board, []) if t.strip()]
+            seen_open = [t.strip() for t in seen.get(board, []) if t.strip()]
+            seen_done = [t.strip() for t in seen.get(f"{board}_done", []) if t.strip()]
             known = [i for i in self.state["items"] if i["board"] == board]
             known_texts = [i["text"] for i in known]
 
-            matched_known = set()
-            for text in seen_texts:
+            open_matched, done_matched = set(), set()
+            for text in seen_open:
                 match = fuzzy_match(text, known_texts)
                 if match is not None:
-                    matched_known.add(match)  # keep canonical text (= Todoist summary)
+                    open_matched.add(match)  # keep canonical text (= Todoist summary)
                     continue
                 if not apply:
                     added.append(text)
@@ -420,29 +458,73 @@ class Syncer:
                     "project": self.cfg.todoist_project,
                     "labels": ["whiteboard", board],
                 }):
-                    self.state["items"].append({"text": text, "board": board, "missing": 0})
+                    self.state["items"].append({"text": text, "board": board,
+                                                "status": "open", "missing": 0,
+                                                "ticked": 0})
                     added.append(text)
                 else:
                     failed += 1
+            for text in seen_done:
+                match = fuzzy_match(text, known_texts)
+                if match is not None:
+                    done_matched.add(match)
+                elif apply:
+                    # First seen already ticked: it was finished before we
+                    # ever tracked it — no Todoist task, but remember it so a
+                    # misread of its tick can't create one later.
+                    self.state["items"].append({"text": text, "board": board,
+                                                "status": "done", "missing": 0,
+                                                "ticked": 0})
 
-            if board in protected:
-                continue  # completions deferred until this board is clear
             for item in known:
-                if item["text"] in matched_known:
+                sighted = item["text"] in open_matched or item["text"] in done_matched
+                ticked = item["text"] in done_matched
+
+                if item["status"] == "done":
+                    # Task already completed; the item just hasn't been
+                    # erased yet. Purge once it actually leaves the board.
+                    if not apply:
+                        continue
+                    if sighted:
+                        item["missing"] = 0
+                    elif board not in protected:
+                        item["missing"] += 1
+                        if item["missing"] >= self.settings["missing_to_complete"]:
+                            self.state["items"].remove(item)
+                    continue
+
+                if ticked:
+                    # Positive signal — honoured even on an obstructed board.
+                    if not apply:
+                        if item["ticked"] + 1 >= self.settings["ticked_to_complete"]:
+                            completed.append(item["text"])
+                        continue
+                    item["missing"] = 0
+                    item["ticked"] += 1
+                    if item["ticked"] >= self.settings["ticked_to_complete"]:
+                        if self._complete_in_todoist(item):
+                            item["status"] = "done"
+                            item["ticked"] = 0
+                            completed.append(item["text"])
+                        else:
+                            failed += 1
+                    continue
+                if item["text"] in open_matched:
                     if apply:
                         item["missing"] = 0
+                        item["ticked"] = 0
                     continue
+                # absent from both lists: erased, or hidden behind something
+                if board in protected:
+                    continue  # hidden vs erased is unknowable — wait
                 if not apply:
                     if item["missing"] + 1 >= self.settings["missing_to_complete"]:
                         completed.append(item["text"])
                     continue
                 item["missing"] += 1
+                item["ticked"] = 0
                 if item["missing"] >= self.settings["missing_to_complete"]:
-                    if self.ha.call("todo", "update_item", {
-                        "entity_id": self.cfg.todo_entity,
-                        "item": item["text"],
-                        "status": "completed",
-                    }):
+                    if self._complete_in_todoist(item):
                         self.state["items"].remove(item)
                         completed.append(item["text"])
                     else:
@@ -653,6 +735,7 @@ ul.items{list-style:none;margin:0;padding:0}
 ul.items li{display:flex;align-items:center;justify-content:space-between;gap:8px;
   padding:5px 0;border-top:1px solid var(--grid);font-size:13px}
 ul.items li:first-child{border-top:0}
+ul.items li.done .txt{text-decoration:line-through;color:var(--muted)}
 .chip{font-size:11px;color:var(--ink2);border:1px solid var(--border);border-radius:999px;
   padding:1px 8px;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
 .chip .dot{width:7px;height:7px}
@@ -784,6 +867,7 @@ const SETTINGS_UI = [
   ['interval_s', 'num', 'Scan interval (s)', { min: 60, max: 86400, step: 60 }],
   ['change_threshold', 'num', 'Change threshold', { min: 0.1, max: 50, step: 0.5 }],
   ['missing_to_complete', 'num', 'Misses to complete', { min: 1, max: 10, step: 1 }],
+  ['ticked_to_complete', 'num', 'Ticks to complete', { min: 1, max: 10, step: 1 }],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
   ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
   ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],
@@ -863,9 +947,12 @@ function render() {
     (st.settings.presence_gate ? ' while away' : '');
 
   const items = st.items || [];
-  const w = items.filter((i) => i.board === 'work').length;
-  $('t-items').textContent = items.length;
-  $('t-items-sub').textContent = w + ' work · ' + (items.length - w) + ' personal';
+  const open = items.filter((i) => i.status !== 'done');
+  const w = open.filter((i) => i.board === 'work').length;
+  $('t-items').textContent = open.length;
+  const doneN = items.length - open.length;
+  $('t-items-sub').textContent = w + ' work · ' + (open.length - w) + ' personal' +
+    (doneN ? ' · ' + doneN + ' ticked on board' : '');
 
   $('t-last').textContent = last ? ago(last.t) : 'never';
   $('t-last-sub').textContent = last ? outcome(last) : 'no scans since start';
@@ -875,13 +962,20 @@ function render() {
     const rows = items.filter((i) => i.board === board);
     if (!rows.length) { ul.appendChild(el('li', 'empty', 'nothing tracked')); continue; }
     for (const it of rows) {
-      const li = el('li'); li.appendChild(el('span', null, it.text));
-      if (it.missing > 0) {
+      const li = el('li', it.status === 'done' ? 'done' : null);
+      li.appendChild(el('span', 'txt', it.text));
+      const state = it.status === 'done'
+        ? ['var(--good)', 'done — erase whenever']
+        : it.ticked > 0
+          ? ['var(--good)', 'ticked ' + it.ticked + '/' + st.settings.ticked_to_complete]
+          : it.missing > 0
+            ? ['var(--serious)', 'missing ' + it.missing + '/' + st.settings.missing_to_complete]
+            : null;
+      if (state) {
         const chip = el('span', 'chip');
-        const d = el('span', 'dot'); d.style.background = 'var(--serious)';
+        const d = el('span', 'dot'); d.style.background = state[0];
         chip.appendChild(d);
-        chip.appendChild(document.createTextNode(
-          'missing ' + it.missing + '/' + st.settings.missing_to_complete));
+        chip.appendChild(document.createTextNode(state[1]));
         li.appendChild(chip);
       }
       ul.appendChild(li);
