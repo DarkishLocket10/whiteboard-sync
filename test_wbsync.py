@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from wbsync import Config, Syncer, fuzzy_match, parse_region
+from wbsync import Config, Syncer, fuzzy_match, normalise_read, parse_region
 
 
 class FakeHA:
@@ -33,7 +33,7 @@ def fake_fetch(syncer):
     syncer._fetch_crop = lambda: (b"jpeg", np.zeros((5, 5), dtype=np.float32))
 
 
-def make_syncer(tmp_path, missing_to_complete=2):
+def make_syncer(tmp_path, missing_to_complete=2, sightings_to_add=1):
     cfg = Config(
         ha_url="http://ha", ha_token="t", ollama_url="http://ollama",
         kinect_url="http://kk", region=(0, 0, 10, 10),
@@ -42,7 +42,11 @@ def make_syncer(tmp_path, missing_to_complete=2):
         missing_to_complete=missing_to_complete, scan_when_home=False,
         model="qwen3-vl:8b-instruct", data_dir=tmp_path,
     )
-    return Syncer(cfg, FakeHA(), reader=None)
+    s = Syncer(cfg, FakeHA(), reader=None)
+    # Most tests predate the sighting streak and exercise immediate adds;
+    # in-memory only, so reloads still see the persisted/default value.
+    s.settings["sightings_to_add"] = sightings_to_add
+    return s
 
 
 def test_parse_region():
@@ -498,3 +502,146 @@ def test_manual_edits_land_in_history(tmp_path):
     assert s.history[-1]["type"] == "manual" and s.history[-1]["action"] == "edit"
     s.remove_item("work", "task v2")
     assert s.history[-1]["action"] == "remove" and s.history[-1]["text"] == "task v2"
+
+
+# -- model output normalisation ---------------------------------------------
+
+def test_normalise_read_maps_checkbox_states_to_lists():
+    raw = {
+        "work": [{"text": "open item", "checkbox": "empty"},
+                 {"text": "ticked item", "checkbox": "marked"},
+                 {"text": "  ", "checkbox": "empty"},        # blank: dropped
+                 "garbage string",                            # junk: dropped
+                 {"checkbox": "marked"}],                     # no text: dropped
+        "personal": [{"text": "chore", "checkbox": "marked"}],
+        "work_obstructed": True,
+    }
+    assert normalise_read(raw) == {
+        "work": ["open item"], "work_done": ["ticked item"],
+        "personal": [], "personal_done": ["chore"],
+        "work_obstructed": True, "personal_obstructed": False,
+    }
+
+
+# -- sighting streak for new items ------------------------------------------
+
+def test_new_item_needs_two_sightings_before_task_created(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    r1 = s.reconcile({"work": ["real new item"], "personal": []})
+    assert r1["added"] == [] and r1["pending"] == ["real new item"]
+    assert s.ha.calls == []                          # nothing hit Todoist yet
+    assert s.state["items"][0] == {"text": "real new item", "board": "work",
+                                   "status": "pending", "missing": 0,
+                                   "ticked": 0, "seen": 1}
+    r2 = s.reconcile({"work": ["real new item"], "personal": []})
+    assert r2["added"] == ["real new item"] and r2["pending"] == []
+    assert s.ha.calls[-1][:2] == ("todoist", "new_task")
+    assert s.state["items"][0]["status"] == "open"
+    assert "seen" not in s.state["items"][0]
+
+
+def test_hallucinated_read_never_reaches_todoist(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.reconcile({"work": ["Buy cake", "Call mom"], "personal": ["Do homework"]})
+    # next read is sane again: the fabrications miss once and die
+    s.reconcile({"work": [], "personal": []})
+    assert s.ha.calls == []
+    assert s.state["items"] == []
+
+
+def test_pending_survives_obstructed_board_but_not_a_clear_miss(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=3)
+    s.reconcile({"work": ["fragment"], "personal": []})
+    # hidden board: pending neither accrues nor dies
+    s.reconcile({"work": [], "personal": [], "work_obstructed": True})
+    assert s.state["items"][0]["seen"] == 1
+    s.reconcile({"work": ["fragment"], "personal": []})
+    assert s.state["items"][0]["seen"] == 2
+    s.reconcile({"work": [], "personal": []})        # clear board, one miss
+    assert s.state["items"] == [] and s.ha.calls == []
+
+
+def test_pending_item_first_ticked_becomes_done_without_task(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.reconcile({"work": ["quick job"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["quick job"], "personal": []})
+    assert s.ha.calls == []                          # no add, no completion
+    assert s.state["items"][0]["status"] == "done"
+
+
+def test_pending_push_failure_retries_next_scan(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.reconcile({"work": ["new item"], "personal": []})
+    s.ha.ok = False
+    r = s.reconcile({"work": ["new item"], "personal": []})
+    assert r["failed"] == 1 and r["added"] == []
+    assert s.state["items"][0]["status"] == "pending"
+    s.ha.ok = True
+    r = s.reconcile({"work": ["new item"], "personal": []})
+    assert r["added"] == ["new item"]
+    assert s.state["items"][0]["status"] == "open"
+
+
+def test_pending_dry_run_previews_without_touching(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.reconcile({"work": ["new item"], "personal": []})
+    s.ha.calls.clear()
+    preview = s.reconcile({"work": ["new item"], "personal": []}, apply=False)
+    assert preview["added"] == ["new item"]          # would confirm next scan
+    assert s.ha.calls == []
+    assert s.state["items"][0]["seen"] == 1          # untouched
+
+
+def test_scan_keeps_reading_unchanged_frames_while_pending_exists(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.reader = FixedReader({"work": ["new item"], "personal": []})
+    fake_fetch(s)
+    s.scan(force=True)                               # pending, baseline saved
+    result = s.scan()                                # identical frame
+    assert result["changed"] is True                 # NOT skipped: pending exists
+    assert result["added"] == ["new item"]
+    result = s.scan()                                # no pending left now
+    assert result["changed"] is False                # skip resumes
+
+
+# -- mass-erase guard --------------------------------------------------------
+
+def test_garbage_read_defers_mass_completions_one_extra_scan(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    texts = ["alpha task", "beta errand", "gamma chore", "delta fix", "epsilon job"]
+    s.settings["sightings_to_add"] = 1
+    s.reconcile({"work": texts, "personal": []})
+    s.settings["sightings_to_add"] = 2
+    s.ha.calls.clear()
+
+    s.reconcile({"work": ["totally fabricated"], "personal": []})      # miss 1
+    r = s.reconcile({"work": ["different nonsense"], "personal": []})  # miss 2
+    assert r["completed"] == [] and r["slowed"] == ["work"]            # deferred
+    assert [c for c in s.ha.calls if c[1] == "update_item"] == []
+    r = s.reconcile({"work": ["yet more junk"], "personal": []})       # miss 3
+    assert sorted(r["completed"]) == sorted(texts)   # persists -> believed
+
+
+def test_resighting_after_garbage_read_resets_cleanly(tmp_path):
+    s = make_syncer(tmp_path)
+    texts = ["alpha task", "beta errand", "gamma chore", "delta fix", "epsilon job"]
+    s.reconcile({"work": texts, "personal": []})
+    s.settings["sightings_to_add"] = 2
+    s.ha.calls.clear()
+    s.reconcile({"work": ["totally fabricated"], "personal": []})      # miss 1
+    s.reconcile({"work": ["different nonsense"], "personal": []})      # miss 2 deferred
+    s.reconcile({"work": texts, "personal": []})                       # good read again
+    assert all(i["missing"] == 0 for i in s.state["items"])
+    assert [c for c in s.ha.calls if c[1] == "update_item"] == []
+    assert len(s.state["items"]) == 5                # fabrications died as pending
+
+
+def test_true_board_wipe_still_completes_at_normal_threshold(tmp_path):
+    s = make_syncer(tmp_path)
+    texts = ["alpha task", "beta errand", "gamma chore", "delta fix", "epsilon job"]
+    s.reconcile({"work": texts, "personal": []})
+    s.ha.calls.clear()
+    s.reconcile({"work": [], "personal": []})        # empty board: miss 1
+    r = s.reconcile({"work": [], "personal": []})    # miss 2: real wipe, no slowdown
+    assert sorted(r["completed"]) == sorted(texts) and r["slowed"] == []
+    assert s.state["items"] == []

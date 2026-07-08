@@ -8,7 +8,9 @@ into Todoist via Home Assistant:
 
 * LEFT board  -> work items,     tagged ["whiteboard", "work"]
 * RIGHT board -> personal items, tagged ["whiteboard", "personal"]
-* New item on a board            -> ``todoist.new_task`` into the Inbox
+* New item on a board            -> ``todoist.new_task`` into the Inbox,
+  after ``sightings_to_add`` consecutive reads (guards against OCR
+  hallucinations and fragments of half-hidden lines becoming tasks)
 * Checkbox TICKED (check/X/fill) -> ``todo.update_item`` completes the task
   after ``ticked_to_complete`` sightings (default 1); the item stays tracked
   as "done" while it remains on the board so tick misreads can't re-add it
@@ -56,6 +58,9 @@ log = logging.getLogger("wbsync")
 FUZZY_MATCH_RATIO = 0.8
 HTTP_PORT = 8430
 EDIT_LOCK_TIMEOUT_S = 5.0  # how long a dashboard edit waits out a running scan
+# When ONE read would complete this many items by ABSENCE while still seeing
+# other items on the board, suspect a garbage read and demand an extra miss.
+MASS_ERASE_MIN = 4
 HISTORY_KEEP = 400  # scan/skip records kept in memory and in data/history.jsonl
 
 # Runtime-tunable settings (dashboard toggles, persisted in data/settings.json;
@@ -71,48 +76,93 @@ SETTING_BOUNDS = {
     "change_threshold": (float, 0.1, 50.0),
     "missing_to_complete": (int, 1, 10),
     "ticked_to_complete": (int, 1, 10),  # tick sightings before completing
+    "sightings_to_add": (int, 1, 10),    # reads a NEW item needs before its task is created
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
     "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
     "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
     "capture_format": ("jpeg", "png"),   # encoding sent to the vision model
 }
 
+# Tick detection is a PER-ITEM forced choice, not two separate lists. The
+# old "open list + done list" schema let the model transcribe a whole board
+# without ever judging a single checkbox, and in production it put every
+# item in "open" (benchmarked 2026-07-08 on a live frame: 10/21 checkbox
+# states correct, all 11 ticks missed). Requiring {"text", "checkbox"} per
+# item scored 18/21 with zero false "marked" — and false negatives are the
+# safe direction, because a missed tick still completes later through the
+# erased-item path. A "describe the mark first" variant scored the same but
+# flipped its errors to false POSITIVES (whole board read as ticked), which
+# would complete live tasks — don't reintroduce it.
 READ_PROMPT = """\
 This photo shows two whiteboards side by side.
 The LEFT board holds WORK to-do items. The RIGHT board holds PERSONAL to-do items.
-Every to-do item has a small square checkbox drawn beside it.
-Sort every readable to-do item into one of two lists per board:
-- OPEN ("work" / "personal"): the checkbox is empty and the text is not
-  crossed out.
-- DONE ("work_done" / "personal_done"): the checkbox contains a check mark,
-  an X, or a scribble filling it, OR the item text is struck through.
+Every to-do item has a small hand-drawn square checkbox at the START of its line.
+
+Transcribe every readable to-do item into the "work" and "personal" arrays,
+one object per item, top to bottom. Write "text" as a short task phrase
+without bullet or checkbox characters, fixing obvious handwriting artifacts.
+
+Then, for EACH item separately, look closely at the small square at the start
+of ITS line and set "checkbox":
+- "empty": the inside of the square is blank white.
+- "marked": ANY pen stroke touches the inside of the square — a check mark,
+  a tick, an X, a diagonal slash, or a scribble. A hasty tick often looks
+  like one short diagonal line crossing the box. Also use "marked" if the
+  item's text is struck through.
+Decide each checkbox on its own evidence; most boards contain a mix of
+empty and marked boxes.
+
 Skip headings, name tags, stickers, photos, and anything that is not a
-to-do list item. Erased items appear in neither list.
+to-do list item. Erased items are not listed.
 A person or object may hide part of a board. Still transcribe every item you
-can actually read — NEVER return empty lists just because a board is
+can actually read — NEVER return empty arrays just because a board is
 partially hidden. Read around the blockage.
 After transcribing, set "work_obstructed" to true if a person, chair, or any
 object hides ANY part of the LEFT board, and "personal_obstructed" to true if
-anything hides ANY part of the RIGHT board — otherwise false.
-Write each item as a short task phrase without bullet or checkbox characters,
-fixing obvious handwriting artifacts."""
+anything hides ANY part of the RIGHT board — otherwise false."""
+
+_READ_ITEM = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "checkbox": {"type": "string", "enum": ["empty", "marked"]},
+    },
+    "required": ["text", "checkbox"],
+    "additionalProperties": False,
+}
 
 READ_SCHEMA = {
     "type": "object",
     "properties": {
         # transcriptions FIRST: the obstruction judgment must not talk the
         # model out of reading the items it can see
-        "work": {"type": "array", "items": {"type": "string"}},
-        "work_done": {"type": "array", "items": {"type": "string"}},
-        "personal": {"type": "array", "items": {"type": "string"}},
-        "personal_done": {"type": "array", "items": {"type": "string"}},
+        "work": {"type": "array", "items": _READ_ITEM},
+        "personal": {"type": "array", "items": _READ_ITEM},
         "work_obstructed": {"type": "boolean"},
         "personal_obstructed": {"type": "boolean"},
     },
-    "required": ["work", "work_done", "personal", "personal_done",
-                 "work_obstructed", "personal_obstructed"],
+    "required": ["work", "personal", "work_obstructed", "personal_obstructed"],
     "additionalProperties": False,
 }
+
+
+def normalise_read(raw: dict) -> dict:
+    """Model output -> the reconciler's shape: {"work": [open texts],
+    "work_done": [ticked texts], ..., "*_obstructed": bool}. Tolerates junk
+    entries (non-dict items, blank text) rather than failing the scan."""
+    seen = {"work_obstructed": bool(raw.get("work_obstructed")),
+            "personal_obstructed": bool(raw.get("personal_obstructed"))}
+    for board in ("work", "personal"):
+        open_, done = [], []
+        for entry in raw.get(board) or []:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text") or "").strip()
+            if text:
+                (done if entry.get("checkbox") == "marked" else open_).append(text)
+        seen[board] = open_
+        seen[f"{board}_done"] = done
+    return seen
 
 
 def parse_region(spec: str) -> tuple[int, int, int, int]:
@@ -233,7 +283,7 @@ class BoardReader:
         content = r.json()["message"].get("content", "")
         if not content.strip():
             raise RuntimeError("model returned empty content")
-        return json.loads(content)
+        return normalise_read(json.loads(content))
 
 
 def fuzzy_match(needle: str, haystack: list[str]) -> Optional[str]:
@@ -290,6 +340,7 @@ class Syncer:
             "change_threshold": cfg.change_threshold,
             "missing_to_complete": cfg.missing_to_complete,
             "ticked_to_complete": cfg.ticked_to_complete,
+            "sightings_to_add": 2,
             "capture_frames": 8,
             "capture_quality": 92,
             "upscale": 1,
@@ -498,9 +549,19 @@ class Syncer:
         """Diff OCR results against known state. With ``apply`` (the default),
         push adds/completions to HA and persist; with ``apply=False`` (dry
         run) just report what WOULD happen, touching nothing.
-        Returns {'added': [...], 'completed': [...]} of item texts plus a
-        'failed' count of HA calls that didn't land (they retry next scan)
-        and the 'protected' boards.
+        Returns {'added': [...], 'completed': [...]} of item texts plus
+        'pending' (new texts still waiting for confirming sightings), a
+        'failed' count of HA calls that didn't land (they retry next scan),
+        the 'protected' boards, and 'slowed' boards where the mass-erase
+        guard deferred completions.
+
+        Addition — a brand-new text does NOT immediately become a Todoist
+        task: it is tracked as status "pending" and the task is only created
+        after ``sightings_to_add`` consecutive processed reads (default 2).
+        Hallucinated items and fragments of half-hidden lines almost never
+        repeat identically between reads; real items always do. A single
+        miss on a clear board drops a pending item, and one first seen
+        ticked converts straight to "done" without ever creating a task.
 
         Completion signals, strongest first:
 
@@ -514,29 +575,27 @@ class Syncer:
           board. After ``missing_to_complete`` consecutive misses the task
           completes and the item is dropped. On a PROTECTED board (flagged
           obstructed while the guard is on) absence proves nothing: no miss
-          is counted, though visible new items are still added.
+          is counted, though visible new items still accrue sightings.
+          Mass-erase guard: when a single read would complete
+          ``MASS_ERASE_MIN`` or more items by absence while the board still
+          shows OTHER items (the signature of a garbage read — a real wipe
+          reads as an empty board), each completion needs one extra miss.
         * Items first seen already ticked never create Todoist tasks; done
           and manually-removed items are purged (no HA call) once they've
           been erased for ``missing_to_complete`` scans."""
         guard = self.settings["obstruction_guard"]
         protected = [b for b in ("work", "personal")
                      if guard and seen.get(f"{b}_obstructed")]
-        added, completed, failed = [], [], 0
+        need_seen = self.settings["sightings_to_add"]
+        base_miss = self.settings["missing_to_complete"]
+        added, completed, pending, slowed, failed = [], [], [], [], 0
         for board in ("work", "personal"):
             seen_open = [t.strip() for t in seen.get(board, []) if t.strip()]
             seen_done = [t.strip() for t in seen.get(f"{board}_done", []) if t.strip()]
             known = [i for i in self.state["items"] if i["board"] == board]
             known_texts = [i["text"] for i in known]
 
-            open_matched, done_matched = set(), set()
-            for text in seen_open:
-                match = fuzzy_match(text, known_texts)
-                if match is not None:
-                    open_matched.add(match)  # keep canonical text (= Todoist summary)
-                    continue
-                if not apply:
-                    added.append(text)
-                    continue
+            def push_task(text: str, board: str = board) -> bool:
                 task = {
                     "content": text,
                     "project": self.cfg.todoist_project,
@@ -546,10 +605,30 @@ class Syncer:
                     # Todoist parses this in the ACCOUNT's timezone — safer
                     # than a date computed on this container's (UTC) clock.
                     task["due_date_string"] = "today"
-                if self.ha.call("todoist", "new_task", task):
+                return self.ha.call("todoist", "new_task", task)
+
+            open_matched, done_matched = set(), set()
+            for text in seen_open:
+                match = fuzzy_match(text, known_texts)
+                if match is not None:
+                    open_matched.add(match)  # keep canonical text (= Todoist summary)
+                    continue
+                if need_seen > 1:
+                    pending.append(text)
+                    if apply:
+                        self.state["items"].append(
+                            {"text": text, "board": board, "status": "pending",
+                             "missing": 0, "ticked": 0, "seen": 1})
+                        known_texts.append(text)  # no same-scan duplicate pendings
+                    continue
+                if not apply:
+                    added.append(text)
+                    continue
+                if push_task(text):
                     self.state["items"].append({"text": text, "board": board,
                                                 "status": "open", "missing": 0,
                                                 "ticked": 0})
+                    known_texts.append(text)
                     added.append(text)
                 else:
                     failed += 1
@@ -564,10 +643,57 @@ class Syncer:
                     self.state["items"].append({"text": text, "board": board,
                                                 "status": "done", "missing": 0,
                                                 "ticked": 0})
+                    known_texts.append(text)
+
+            # Mass-erase guard (see docstring): completing many items by
+            # absence in one read, while the read still shows other items,
+            # looks like a hallucinated/partial read — not like an erased
+            # board. Slow those completions down by one extra miss.
+            miss_needed = base_miss
+            if board not in protected and (seen_open or seen_done):
+                doomed = [i for i in known
+                          if i["status"] == "open"
+                          and i["text"] not in open_matched
+                          and i["text"] not in done_matched
+                          and i["missing"] + 1 >= base_miss]
+                if len(doomed) >= MASS_ERASE_MIN:
+                    miss_needed = base_miss + 1
+                    slowed.append(board)
 
             for item in known:
                 sighted = item["text"] in open_matched or item["text"] in done_matched
                 ticked = item["text"] in done_matched
+
+                if item["status"] == "pending":
+                    # No Todoist task exists yet. Sightings must be
+                    # CONSECUTIVE: one miss on a clear board kills the item
+                    # — that strictness is the whole anti-hallucination
+                    # point, and a real item just starts accruing again.
+                    if not apply:
+                        if not ticked and sighted and item["seen"] + 1 >= need_seen:
+                            added.append(item["text"])
+                        elif sighted:
+                            pending.append(item["text"])
+                        continue
+                    if ticked:
+                        # Finished before we ever believed in it — never a task.
+                        item.pop("seen", None)
+                        item["status"] = "done"
+                        item["missing"] = 0
+                    elif sighted:
+                        item["seen"] += 1
+                        if item["seen"] >= need_seen:
+                            if push_task(item["text"]):
+                                item.pop("seen", None)
+                                item["status"] = "open"
+                                added.append(item["text"])
+                            else:
+                                failed += 1  # stays pending; retries next scan
+                        else:
+                            pending.append(item["text"])
+                    elif board not in protected:
+                        self.state["items"].remove(item)
+                    continue
 
                 if item["status"] != "open":
                     # "done": task already completed. "removed": task deleted
@@ -579,7 +705,7 @@ class Syncer:
                         item["missing"] = 0
                     elif board not in protected:
                         item["missing"] += 1
-                        if item["missing"] >= self.settings["missing_to_complete"]:
+                        if item["missing"] >= base_miss:
                             self.state["items"].remove(item)
                     continue
 
@@ -608,12 +734,12 @@ class Syncer:
                 if board in protected:
                     continue  # hidden vs erased is unknowable — wait
                 if not apply:
-                    if item["missing"] + 1 >= self.settings["missing_to_complete"]:
+                    if item["missing"] + 1 >= miss_needed:
                         completed.append(item["text"])
                     continue
                 item["missing"] += 1
                 item["ticked"] = 0
-                if item["missing"] >= self.settings["missing_to_complete"]:
+                if item["missing"] >= miss_needed:
                     if self._complete_in_todoist(item):
                         self.state["items"].remove(item)
                         completed.append(item["text"])
@@ -621,8 +747,8 @@ class Syncer:
                         failed += 1
         if apply:
             self._save_items()
-        return {"added": added, "completed": completed, "failed": failed,
-                "protected": protected}
+        return {"added": added, "completed": completed, "pending": pending,
+                "failed": failed, "protected": protected, "slowed": slowed}
 
     # -- scan -------------------------------------------------------------
     def scan(self, force: bool = False, dry: bool = False, trigger: str = "manual") -> dict:
@@ -649,8 +775,12 @@ class Syncer:
         s = self.settings
         diff = self._diff_score(gray)
         base = {"diff": None if diff is None else round(diff, 2)}
-        if (not force and s["change_detection"] and diff is not None
-                and diff < s["change_threshold"]):
+        # Pending items confirm through consecutive PROCESSED reads, but the
+        # board doesn't change while they wait — skipping unchanged frames
+        # would strand them forever. Keep reading until none are pending.
+        has_pending = any(i["status"] == "pending" for i in self.state["items"])
+        if (not force and s["change_detection"] and not has_pending
+                and diff is not None and diff < s["change_threshold"]):
             return {"ok": True, "changed": False, **base}
         try:
             seen = self.reader.read(jpeg)
@@ -942,8 +1072,12 @@ function outcome(r) {
   const a = (r.added || []).length, c = (r.completed || []).length;
   let s = r.dry ? 'dry run: would add ' + a + ', complete ' + c
                 : a + ' added, ' + c + ' completed';
+  if (Array.isArray(r.pending) && r.pending.length)
+    s += ', ' + r.pending.length + ' new awaiting confirmation';
   if (Array.isArray(r.obstructed) && r.obstructed.length)
     s += ' (' + r.obstructed.join(' + ') + ' board blocked — completions deferred)';
+  if (Array.isArray(r.slowed) && r.slowed.length)
+    s += ' (mass-erase guard: ' + r.slowed.join(' + ') + ' completions slowed)';
   if (r.obstructed_ignored) s += ' (obstruction ignored)';               // legacy
   if (r.failed) s += ' (' + r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry)';
   return s;
@@ -967,6 +1101,7 @@ const SETTINGS_UI = [
   ['change_threshold', 'num', 'Change threshold', { min: 0.1, max: 50, step: 0.5 }],
   ['missing_to_complete', 'num', 'Misses to complete', { min: 1, max: 10, step: 1 }],
   ['ticked_to_complete', 'num', 'Ticks to complete', { min: 1, max: 10, step: 1 }],
+  ['sightings_to_add', 'num', 'Sightings to create task', { min: 1, max: 10, step: 1 }],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
   ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
   ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],
@@ -1051,7 +1186,9 @@ function render() {
   $('t-items').textContent = open.length;
   const doneN = items.filter((i) => i.status === 'done').length;
   const removedN = items.filter((i) => i.status === 'removed').length;
+  const pendingN = items.filter((i) => i.status === 'pending').length;
   $('t-items-sub').textContent = w + ' work · ' + (open.length - w) + ' personal' +
+    (pendingN ? ' · ' + pendingN + ' unconfirmed' : '') +
     (doneN ? ' · ' + doneN + ' ticked on board' : '') +
     (removedN ? ' · ' + removedN + ' removed' : '');
 
@@ -1063,14 +1200,17 @@ function render() {
     const rows = items.filter((i) => i.board === board);
     if (!rows.length) { ul.appendChild(el('li', 'empty', 'nothing tracked')); continue; }
     for (const it of rows) {
-      const li = el('li', it.status !== 'open' ? 'done' : null);
+      const li = el('li', it.status === 'done' || it.status === 'removed' ? 'done' : null);
       li.appendChild(el('span', 'txt', it.text));
       const end = el('span', 'end');
       const state = it.status === 'done'
         ? ['var(--good)', 'done — erase whenever']
         : it.status === 'removed'
           ? ['var(--muted)', 'removed — ignored until erased']
-          : it.ticked > 0
+          : it.status === 'pending'
+            ? ['var(--warn)', 'seen ' + it.seen + '/' + st.settings.sightings_to_add +
+               ' — no task yet']
+            : it.ticked > 0
             ? ['var(--good)', 'ticked ' + it.ticked + '/' + st.settings.ticked_to_complete]
             : it.missing > 0
               ? ['var(--serious)', 'missing ' + it.missing + '/' + st.settings.missing_to_complete]
@@ -1247,8 +1387,11 @@ function removeItem(it) {
     ? 'Remove \\u201c' + it.text + '\\u201d?\\n\\nDeletes the Todoist task. While the ' +
       'writing is still on the board the item stays listed as \\u201cremoved\\u201d ' +
       'so it can\\u2019t be re-added; it disappears once erased.'
-    : 'Remove \\u201c' + it.text + '\\u201d from tracking? (Its Todoist task is ' +
-      'already completed.)';
+    : it.status === 'pending'
+      ? 'Remove \\u201c' + it.text + '\\u201d? (No Todoist task exists yet — this ' +
+        'just stops it from becoming one.)'
+      : 'Remove \\u201c' + it.text + '\\u201d from tracking? (Its Todoist task is ' +
+        'already completed.)';
   if (!confirm(msg)) return;
   itemCall('/api/items/remove', { board: it.board, text: it.text },
     'Removed \\u201c' + it.text + '\\u201d');

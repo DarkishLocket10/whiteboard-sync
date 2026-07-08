@@ -30,9 +30,26 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   "clean up" state by hand while tasks are open. Items carry a `status`:
   "open" (task live in Todoist), "done" (task completed but the ticked
   item is still physically on the board — kept so tick misreads can't
-  re-create the task; purged after it's erased), or "removed" (manually
+  re-create the task; purged after it's erased), "removed" (manually
   removed on the dashboard: Todoist task deleted, kept like "done" so the
-  writing still on the board can't re-create it).
+  writing still on the board can't re-create it), or "pending" (new text
+  awaiting `sightings_to_add` consecutive reads before its task is
+  created; one miss on a clear board kills it).
+- The vision schema asks for a PER-ITEM `{"text", "checkbox": empty|marked}`
+  decision. Do not regress to separate open/done lists: benchmarked
+  2026-07-08 on a live frame, the list schema missed ALL 11 ticks (10/21
+  checkbox states right); the per-item schema scored 18/21 with only safe
+  false negatives. A "describe the mark first" field flipped errors to
+  false positives (whole board read as ticked) — also don't do that.
+- Reconcile guards, both bench-driven by real incidents from 2026-07-08
+  history: new items wait for `sightings_to_add` (default 2) consecutive
+  reads (a scan hallucinated "Buy cake"/"Call mom" into real Todoist tasks;
+  fragments of half-hidden lines became tasks), and a mass-erase guard
+  demands one extra miss when ≥4 items would absence-complete in one scan
+  while the board still shows other items (17 tasks were once falsely
+  completed by one garbage read). A real full-board wipe reads as an EMPTY
+  board and is not slowed. Change detection is bypassed while any item is
+  pending, so sightings can accrue on an unchanged board.
 - Item edits belong on the dashboard, not in the JSON: the ✎/× buttons hit
   `POST /api/items/edit` (renames the Todoist task too, keeping state
   canonical) and `POST /api/items/remove` (deletes the Todoist task via
