@@ -55,6 +55,7 @@ log = logging.getLogger("wbsync")
 
 FUZZY_MATCH_RATIO = 0.8
 HTTP_PORT = 8430
+EDIT_LOCK_TIMEOUT_S = 5.0  # how long a dashboard edit waits out a running scan
 HISTORY_KEEP = 400  # scan/skip records kept in memory and in data/history.jsonl
 
 # Runtime-tunable settings (dashboard toggles, persisted in data/settings.json;
@@ -350,6 +351,87 @@ class Syncer:
             log.info("settings changed: %s", json.dumps(applied))
         return {"applied": applied, "rejected": rejected}
 
+    # -- manual item edits (dashboard) --------------------------------------
+    def _save_items(self) -> None:
+        write_json_atomic(self._state_path, self.state)
+        self.items_view = [dict(i) for i in self.state["items"]]
+
+    def _find_item(self, board: str, text: str) -> Optional[dict]:
+        for item in self.state["items"]:
+            if item["board"] == board and item["text"] == text:
+                return item
+        return None
+
+    def edit_item(self, board: str, text: str, new_text: str) -> tuple[int, dict]:
+        """Rename a tracked item from the dashboard. For open items the
+        Todoist task is renamed too (state text is canonical — it must stay
+        byte-identical to the task summary or completion can't find it);
+        if that HA call fails nothing changes locally. Returns (http status,
+        body)."""
+        new_text = (new_text or "").strip()
+        if not new_text:
+            return 400, {"error": "new text is empty"}
+        # Scans hold the lock for their whole run (the vision call can take
+        # minutes) — don't hang the dashboard waiting, tell the user instead.
+        if not self._lock.acquire(timeout=EDIT_LOCK_TIMEOUT_S):
+            return 409, {"error": "a scan is running — try again in a moment"}
+        try:
+            item = self._find_item(board, text)
+            if item is None:
+                return 404, {"error": "item not found — state changed, refreshing"}
+            if new_text == text:
+                return 200, {"ok": True, "item": dict(item)}
+            if self._find_item(board, new_text) is not None:
+                return 400, {"error": "another item on this board already has that text"}
+            if item["status"] == "open":
+                if not self.ha.call("todo", "update_item", {
+                        "entity_id": self.cfg.todo_entity,
+                        "item": text, "rename": new_text}):
+                    return 502, {"error": "Todoist rename via HA failed — item unchanged"}
+            item["text"] = new_text
+            self._save_items()
+            self._record({"type": "manual", "action": "edit", "board": board,
+                          "from": text, "to": new_text})
+            log.info("manual edit [%s] %r -> %r", board, text, new_text)
+            body = {"ok": True, "item": dict(item)}
+            if item["status"] == "open" and difflib.SequenceMatcher(
+                    None, text.lower(), new_text.lower()).ratio() < FUZZY_MATCH_RATIO:
+                body["warning"] = ("new text no longer resembles the board writing — "
+                                   "the next scan may re-add what's written and count "
+                                   "this item missing")
+            return 200, body
+        finally:
+            self._lock.release()
+
+    def remove_item(self, board: str, text: str) -> tuple[int, dict]:
+        """Remove a tracked item from the dashboard: delete its Todoist task
+        (open items only — done/removed ones have no live task) and stop
+        treating it as a to-do. The item is NOT dropped from state while its
+        writing may still be on the board — a dropped item would come back
+        as a brand-new task on the next processed read. Status "removed"
+        behaves like "done": ignored by reconciliation, purged after it has
+        been erased for ``missing_to_complete`` scans."""
+        if not self._lock.acquire(timeout=EDIT_LOCK_TIMEOUT_S):
+            return 409, {"error": "a scan is running — try again in a moment"}
+        try:
+            item = self._find_item(board, text)
+            if item is None:
+                return 404, {"error": "item not found — state changed, refreshing"}
+            if item["status"] == "open":
+                if not self.ha.call("todo", "remove_item", {
+                        "entity_id": self.cfg.todo_entity, "item": text}):
+                    return 502, {"error": "Todoist delete via HA failed — item kept"}
+            item["status"] = "removed"
+            item["missing"] = 0
+            item["ticked"] = 0
+            self._save_items()
+            self._record({"type": "manual", "action": "remove", "board": board,
+                          "text": text})
+            log.info("manual remove [%s] %r", board, text)
+            return 200, {"ok": True, "item": dict(item)}
+        finally:
+            self._lock.release()
+
     # -- imaging --------------------------------------------------------
     def _fetch_crop(self) -> tuple[bytes, np.ndarray]:
         s = self.settings
@@ -434,8 +516,8 @@ class Syncer:
           obstructed while the guard is on) absence proves nothing: no miss
           is counted, though visible new items are still added.
         * Items first seen already ticked never create Todoist tasks; done
-          items are purged (no HA call) once they've been erased for
-          ``missing_to_complete`` scans."""
+          and manually-removed items are purged (no HA call) once they've
+          been erased for ``missing_to_complete`` scans."""
         guard = self.settings["obstruction_guard"]
         protected = [b for b in ("work", "personal")
                      if guard and seen.get(f"{b}_obstructed")]
@@ -487,9 +569,10 @@ class Syncer:
                 sighted = item["text"] in open_matched or item["text"] in done_matched
                 ticked = item["text"] in done_matched
 
-                if item["status"] == "done":
-                    # Task already completed; the item just hasn't been
-                    # erased yet. Purge once it actually leaves the board.
+                if item["status"] != "open":
+                    # "done": task already completed. "removed": task deleted
+                    # from the dashboard. Either way the item just hasn't
+                    # been erased yet. Purge once it actually leaves the board.
                     if not apply:
                         continue
                     if sighted:
@@ -537,8 +620,7 @@ class Syncer:
                     else:
                         failed += 1
         if apply:
-            write_json_atomic(self._state_path, self.state)
-            self.items_view = [dict(i) for i in self.state["items"]]
+            self._save_items()
         return {"added": added, "completed": completed, "failed": failed,
                 "protected": protected}
 
@@ -743,6 +825,11 @@ ul.items li{display:flex;align-items:center;justify-content:space-between;gap:8p
   padding:5px 0;border-top:1px solid var(--grid);font-size:13px}
 ul.items li:first-child{border-top:0}
 ul.items li.done .txt{text-decoration:line-through;color:var(--muted)}
+ul.items li .txt{flex:1;overflow-wrap:anywhere}
+ul.items li .end{display:flex;align-items:center;gap:6px;flex:none}
+button.ib{padding:0;width:24px;height:22px;line-height:20px;font-size:13px;
+  border-radius:6px;color:var(--muted);background:transparent}
+button.ib:hover{color:var(--ink);background:var(--surface)}
 .chip{font-size:11px;color:var(--ink2);border:1px solid var(--border);border-radius:999px;
   padding:1px 8px;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
 .chip .dot{width:7px;height:7px}
@@ -844,6 +931,9 @@ const who = () => ((st.presence.entity || '').replace('person.', '').split('_')[
 function outcome(r) {
   if (r.type === 'settings') return 'settings: ' + Object.entries(r.changed || {})
     .map(([k, v]) => k + '=' + v).join(', ');
+  if (r.type === 'manual') return r.action === 'edit'
+    ? 'edited (' + r.board + '): “' + r.from + '” → “' + r.to + '”'
+    : 'removed (' + r.board + '): “' + r.text + '”';
   if (r.type === 'skip') return r.reason === 'home'
     ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
@@ -859,7 +949,8 @@ function outcome(r) {
   return s;
 }
 function kind(r) {
-  if (r.type === 'skip' || r.type === 'settings' || r.changed === false) return 'muted';
+  if (r.type === 'skip' || r.type === 'settings' || r.type === 'manual'
+      || r.changed === false) return 'muted';
   if (r.error) return 'crit';
   if (r.failed || r.obstructed || r.obstructed_ignored) return 'warn';
   return 'good';
@@ -955,12 +1046,14 @@ function render() {
     (st.settings.presence_gate ? ' while away' : '');
 
   const items = st.items || [];
-  const open = items.filter((i) => i.status !== 'done');
+  const open = items.filter((i) => i.status === 'open');
   const w = open.filter((i) => i.board === 'work').length;
   $('t-items').textContent = open.length;
-  const doneN = items.length - open.length;
+  const doneN = items.filter((i) => i.status === 'done').length;
+  const removedN = items.filter((i) => i.status === 'removed').length;
   $('t-items-sub').textContent = w + ' work · ' + (open.length - w) + ' personal' +
-    (doneN ? ' · ' + doneN + ' ticked on board' : '');
+    (doneN ? ' · ' + doneN + ' ticked on board' : '') +
+    (removedN ? ' · ' + removedN + ' removed' : '');
 
   $('t-last').textContent = last ? ago(last.t) : 'never';
   $('t-last-sub').textContent = last ? outcome(last) : 'no scans since start';
@@ -970,22 +1063,36 @@ function render() {
     const rows = items.filter((i) => i.board === board);
     if (!rows.length) { ul.appendChild(el('li', 'empty', 'nothing tracked')); continue; }
     for (const it of rows) {
-      const li = el('li', it.status === 'done' ? 'done' : null);
+      const li = el('li', it.status !== 'open' ? 'done' : null);
       li.appendChild(el('span', 'txt', it.text));
+      const end = el('span', 'end');
       const state = it.status === 'done'
         ? ['var(--good)', 'done — erase whenever']
-        : it.ticked > 0
-          ? ['var(--good)', 'ticked ' + it.ticked + '/' + st.settings.ticked_to_complete]
-          : it.missing > 0
-            ? ['var(--serious)', 'missing ' + it.missing + '/' + st.settings.missing_to_complete]
-            : null;
+        : it.status === 'removed'
+          ? ['var(--muted)', 'removed — ignored until erased']
+          : it.ticked > 0
+            ? ['var(--good)', 'ticked ' + it.ticked + '/' + st.settings.ticked_to_complete]
+            : it.missing > 0
+              ? ['var(--serious)', 'missing ' + it.missing + '/' + st.settings.missing_to_complete]
+              : null;
       if (state) {
         const chip = el('span', 'chip');
         const d = el('span', 'dot'); d.style.background = state[0];
         chip.appendChild(d);
         chip.appendChild(document.createTextNode(state[1]));
-        li.appendChild(chip);
+        end.appendChild(chip);
       }
+      const be = el('button', 'ib', '\\u270e'); be.title = 'Edit task text';
+      be.addEventListener('click', () => editItem(it));
+      end.appendChild(be);
+      if (it.status !== 'removed') {
+        const bx = el('button', 'ib', '\\u00d7');
+        bx.title = it.status === 'open'
+          ? 'Remove — deletes the Todoist task' : 'Remove from tracking';
+        bx.addEventListener('click', () => removeItem(it));
+        end.appendChild(bx);
+      }
+      li.appendChild(end);
       ul.appendChild(li);
     }
   }
@@ -1117,6 +1224,36 @@ function countdown() {
   $('t-next').textContent = mmss(left);
 }
 
+async function itemCall(path, body, okMsg) {
+  try {
+    const r = await fetch(path, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json();
+    $('note').textContent = j.error ? 'Failed: ' + j.error
+      : okMsg + (j.warning ? ' — warning: ' + j.warning : '');
+  } catch (e) { $('note').textContent = 'Request failed: ' + e; }
+  refresh();
+}
+function editItem(it) {
+  const nt = prompt(it.status === 'open'
+    ? 'Edit task text (also renames the Todoist task):'
+    : 'Edit tracked text:', it.text);
+  if (nt === null || !nt.trim() || nt.trim() === it.text) return;
+  itemCall('/api/items/edit', { board: it.board, text: it.text, new_text: nt },
+    'Renamed to \\u201c' + nt.trim() + '\\u201d');
+}
+function removeItem(it) {
+  const msg = it.status === 'open'
+    ? 'Remove \\u201c' + it.text + '\\u201d?\\n\\nDeletes the Todoist task. While the ' +
+      'writing is still on the board the item stays listed as \\u201cremoved\\u201d ' +
+      'so it can\\u2019t be re-added; it disappears once erased.'
+    : 'Remove \\u201c' + it.text + '\\u201d from tracking? (Its Todoist task is ' +
+      'already completed.)';
+  if (!confirm(msg)) return;
+  itemCall('/api/items/remove', { board: it.board, text: it.text },
+    'Removed \\u201c' + it.text + '\\u201d');
+}
+
 async function doScan(dry) {
   $('btn-scan').disabled = $('btn-dry').disabled = true;
   $('note').textContent = (dry ? 'Dry-run scan' : 'Scan') +
@@ -1198,6 +1335,25 @@ def serve_http(syncer: Syncer) -> None:
                     self._json(400, {"error": f"bad body: {exc}"})
                     return
                 self._json(200, syncer.update_settings(patch))
+            elif url.path in ("/api/items/edit", "/api/items/remove"):
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(body, dict):
+                        raise ValueError("want a JSON object")
+                    board, text = body.get("board"), body.get("text")
+                    if board not in ("work", "personal") or not isinstance(text, str):
+                        raise ValueError("want board ('work'|'personal') and text")
+                    if url.path.endswith("/edit") and not isinstance(body.get("new_text"), str):
+                        raise ValueError("want new_text")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    self._json(400, {"error": f"bad body: {exc}"})
+                    return
+                if url.path.endswith("/edit"):
+                    code, resp = syncer.edit_item(board, text, body["new_text"])
+                else:
+                    code, resp = syncer.remove_item(board, text)
+                self._json(code, resp)
             else:
                 self._json(404, {"error": "not found"})
 

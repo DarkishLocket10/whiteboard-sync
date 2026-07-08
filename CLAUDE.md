@@ -28,9 +28,17 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
 - `data/state.json` item texts are canonical — they must stay byte-identical
   to the Todoist task summaries or completions can't find their task. Don't
   "clean up" state by hand while tasks are open. Items carry a `status`:
-  "open" (task live in Todoist) or "done" (task completed but the ticked
+  "open" (task live in Todoist), "done" (task completed but the ticked
   item is still physically on the board — kept so tick misreads can't
-  re-create the task; purged after it's erased).
+  re-create the task; purged after it's erased), or "removed" (manually
+  removed on the dashboard: Todoist task deleted, kept like "done" so the
+  writing still on the board can't re-create it).
+- Item edits belong on the dashboard, not in the JSON: the ✎/× buttons hit
+  `POST /api/items/edit` (renames the Todoist task too, keeping state
+  canonical) and `POST /api/items/remove` (deletes the Todoist task via
+  `todo.remove_item`). Both take `{board, text}` (+`new_text` for edit),
+  refuse with 409 while a scan holds the lock, and fail without touching
+  state if the HA call fails.
 - The change-detection baseline (`data/baseline.npy`) only updates after a
   *processed* read whose HA pushes ALL succeeded, so a failed model call or
   a failed Todoist push retries on the next interval.

@@ -382,3 +382,119 @@ def test_dry_run_reports_tick_completions_without_touching(tmp_path):
     assert preview["completed"] == ["task"]
     assert s.ha.calls == []
     assert s.state["items"][0]["status"] == "open"   # untouched
+
+
+def test_edit_renames_todoist_task_and_state(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["Bluetooth Adapter"], "personal": []})
+    s.ha.calls.clear()
+    code, body = s.edit_item("work", "Bluetooth Adapter", "Bluetooth Adaptor ")
+    assert code == 200 and body["ok"]
+    assert "warning" not in body                     # similar text: no warning
+    assert s.ha.calls == [("todo", "update_item", {
+        "entity_id": "todo.inbox",
+        "item": "Bluetooth Adapter", "rename": "Bluetooth Adaptor",
+    })]
+    assert s.state["items"][0]["text"] == "Bluetooth Adaptor"
+    # the rename persisted — a restart must still see the canonical text
+    assert make_syncer(tmp_path).state["items"][0]["text"] == "Bluetooth Adaptor"
+    # ...and future completions use the NEW canonical text
+    s.ha.calls.clear()
+    s.reconcile({"work": [], "personal": []})
+    s.reconcile({"work": [], "personal": []})
+    assert s.ha.calls[-1][2]["item"] == "Bluetooth Adaptor"
+
+
+def test_edit_warns_when_new_text_wont_fuzzy_match(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["buy milk"], "personal": []})
+    code, body = s.edit_item("work", "buy milk", "call the plumber")
+    assert code == 200 and "warning" in body
+
+
+def test_edit_failed_ha_rename_changes_nothing(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.ok = False
+    code, body = s.edit_item("work", "task", "renamed")
+    assert code == 502 and "error" in body
+    assert s.state["items"][0]["text"] == "task"
+
+
+def test_edit_done_item_skips_ha_call(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    s.ha.calls.clear()
+    code, _ = s.edit_item("work", "task", "task (was misread)")
+    assert code == 200 and s.ha.calls == []
+    assert s.state["items"][0]["text"] == "task (was misread)"
+
+
+def test_edit_rejects_empty_duplicate_and_unknown(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["one", "completely different"], "personal": []})
+    assert s.edit_item("work", "one", "   ")[0] == 400
+    assert s.edit_item("work", "one", "completely different")[0] == 400
+    assert s.edit_item("work", "no such item", "x")[0] == 404
+    assert s.edit_item("personal", "one", "x")[0] == 404  # wrong board
+
+
+def test_remove_deletes_todoist_task_and_ignores_until_erased(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["misread item"], "personal": []})
+    s.ha.calls.clear()
+    code, body = s.remove_item("work", "misread item")
+    assert code == 200 and body["ok"]
+    assert s.ha.calls == [("todo", "remove_item", {
+        "entity_id": "todo.inbox", "item": "misread item"})]
+    assert s.state["items"][0]["status"] == "removed"
+    # still written on the board: NOT re-added as a new task
+    s.ha.calls.clear()
+    result = s.reconcile({"work": ["misread item"], "personal": []})
+    assert result["added"] == [] and s.ha.calls == []
+    # erased: purged after missing_to_complete scans, without any HA call
+    s.reconcile({"work": [], "personal": []})
+    s.reconcile({"work": [], "personal": []})
+    assert s.state["items"] == [] and s.ha.calls == []
+
+
+def test_remove_done_item_skips_ha_call(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    s.ha.calls.clear()
+    code, _ = s.remove_item("work", "task")
+    assert code == 200 and s.ha.calls == []
+    assert s.state["items"][0]["status"] == "removed"
+
+
+def test_remove_failed_ha_delete_keeps_item_open(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.ok = False
+    code, _ = s.remove_item("work", "task")
+    assert code == 502
+    assert s.state["items"][0]["status"] == "open"
+
+
+def test_manual_edits_refuse_rather_than_block_during_a_scan(tmp_path, monkeypatch):
+    import wbsync
+    monkeypatch.setattr(wbsync, "EDIT_LOCK_TIMEOUT_S", 0.05)
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s._lock.acquire()  # a scan is holding the lock
+    try:
+        assert s.edit_item("work", "task", "renamed")[0] == 409
+        assert s.remove_item("work", "task")[0] == 409
+    finally:
+        s._lock.release()
+
+
+def test_manual_edits_land_in_history(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.edit_item("work", "task", "task v2")
+    assert s.history[-1]["type"] == "manual" and s.history[-1]["action"] == "edit"
+    s.remove_item("work", "task v2")
+    assert s.history[-1]["action"] == "remove" and s.history[-1]["text"] == "task v2"
