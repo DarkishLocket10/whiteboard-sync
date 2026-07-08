@@ -90,11 +90,15 @@ SETTING_BOUNDS = {
 # without ever judging a single checkbox, and in production it put every
 # item in "open" (benchmarked 2026-07-08 on a live frame: 10/21 checkbox
 # states correct, all 11 ticks missed). Requiring {"text", "checkbox"} per
-# item scored 18/21 with zero false "marked" — and false negatives are the
-# safe direction, because a missed tick still completes later through the
-# erased-item path. A "describe the mark first" variant scored the same but
-# flipped its errors to false POSITIVES (whole board read as ticked), which
-# would complete live tasks — don't reintroduce it.
+# item fixed that, and naming the mark SHAPES as enum values (a thin slash
+# doesn't activate a generic "marked" concept, but activates "slash")
+# scored 77/84 over four clear frames with ZERO false "marked" — false
+# negatives are the safe direction, because a missed tick still completes
+# later through the erased-item path. Two variants that scored worse and
+# flipped errors to false POSITIVES (whole board read as ticked, which
+# would complete live tasks): a free-text "describe the mark first" field,
+# and a six-value enum with "struck_text" as its own checkbox category.
+# Don't reintroduce either; benchmark any change with tools/bench_read.py.
 READ_PROMPT = """\
 This photo shows two whiteboards side by side.
 The LEFT board holds WORK to-do items. The RIGHT board holds PERSONAL to-do items.
@@ -106,13 +110,13 @@ without bullet or checkbox characters, fixing obvious handwriting artifacts.
 
 Then, for EACH item separately, look closely at the small square at the start
 of ITS line and set "checkbox":
-- "empty": the inside of the square is blank white.
-- "marked": ANY pen stroke touches the inside of the square — a check mark,
-  a tick, an X, a diagonal slash, or a scribble. A hasty tick often looks
-  like one short diagonal line crossing the box. Also use "marked" if the
-  item's text is struck through.
-Decide each checkbox on its own evidence; most boards contain a mix of
-empty and marked boxes.
+- "empty": the inside of the square is blank white — no stroke at all.
+- "slash": one thin diagonal or straight line crosses the square (a hasty
+  tick often looks like this).
+- "check_x_or_scribble": a check mark, an X, or a scribble in the square;
+  ALSO use this when the item's text is struck through or crossed out,
+  whatever its checkbox looks like.
+Decide each checkbox on its own evidence; most boards contain a mix.
 
 Skip headings, name tags, stickers, photos, and anything that is not a
 to-do list item. Erased items are not listed.
@@ -127,7 +131,8 @@ _READ_ITEM = {
     "type": "object",
     "properties": {
         "text": {"type": "string"},
-        "checkbox": {"type": "string", "enum": ["empty", "marked"]},
+        "checkbox": {"type": "string",
+                     "enum": ["empty", "slash", "check_x_or_scribble"]},
     },
     "required": ["text", "checkbox"],
     "additionalProperties": False,
@@ -161,7 +166,11 @@ def normalise_read(raw: dict) -> dict:
                 continue
             text = str(entry.get("text") or "").strip()
             if text:
-                (done if entry.get("checkbox") == "marked" else open_).append(text)
+                # any named mark shape counts as ticked; a missing/unknown
+                # checkbox value degrades to open (the safe direction)
+                box = entry.get("checkbox") or "empty"
+                (done if box in ("slash", "check_x_or_scribble") else open_
+                 ).append(text)
         seen[board] = open_
         seen[f"{board}_done"] = done
     return seen

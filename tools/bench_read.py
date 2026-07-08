@@ -9,12 +9,17 @@ Run before changing READ_PROMPT/READ_SCHEMA — never tune those blind:
 GT below is the boards as photographed on 2026-07-08 (checkbox truth
 verified by zooming the checkbox columns). If the boards have changed,
 re-establish ground truth from a fresh photo FIRST, then update GT.
-Score to beat: V1 (the deployed per-item schema) = 18/21 on that frame,
-with every error a false negative — false "marked" positives are the
-dangerous direction (they complete live tasks) and must stay at zero.
-V0 (the pre-2026-07-08 two-list schema) scored 10/21: all 11 ticks missed.
-Obstructed frames flip checkbox reads randomly (that's why reconcile
-distrusts ticks on protected boards) — bench on a CLEAR frame.
+Score to beat: V9 (deployed since 2026-07-08 evening: per-item enum with
+NAMED mark shapes empty/slash/check_x_or_scribble) = 77/84 over four clear
+frames, zero false positives. V1 (generic empty/marked) = 72/84. V0 (the
+original two-list schema) = 10/21 on one frame: all 11 ticks missed.
+False "marked" positives are the dangerous direction (they complete live
+tasks) and must stay at ZERO; false negatives only delay completion until
+the item is erased. Variants that flipped errors to false positives — do
+not retry: free-text "describe the mark" field; "struck_text" as its own
+checkbox enum value; 3x upscale. Obstructed frames flip checkbox reads
+randomly (that is why reconcile distrusts ticks on protected boards) —
+bench on CLEAR frames only.
 """
 import base64, difflib, io, json, sys, time
 import requests
@@ -172,6 +177,36 @@ Set "obstructed" to true if a person, chair, or any object hides ANY part of
 this board — otherwise false."""
 
 
+# V9 == the deployed prompt/schema (keep in sync with wbsync.READ_PROMPT).
+ITEM9 = {"type": "object", "properties": {
+    "text": {"type": "string"},
+    "checkbox": {"type": "string",
+                 "enum": ["empty", "slash", "check_x_or_scribble"]}},
+    "required": ["text", "checkbox"], "additionalProperties": False}
+V9_SCHEMA = {"type": "object", "properties": {
+    "work": {"type": "array", "items": ITEM9},
+    "personal": {"type": "array", "items": ITEM9},
+    "work_obstructed": {"type": "boolean"},
+    "personal_obstructed": {"type": "boolean"}},
+    "required": ["work", "personal", "work_obstructed", "personal_obstructed"],
+    "additionalProperties": False}
+V9_PROMPT = V1_PROMPT.replace(
+    """- "empty": the inside of the square is blank white.
+- "marked": ANY pen stroke touches the inside of the square — a check mark,
+  a tick, an X, a diagonal slash, or a scribble. A hasty tick often looks
+  like one short diagonal line crossing the box. Also use "marked" if the
+  item's text is struck through.
+Decide each checkbox on its own evidence; most boards contain a mix of
+empty and marked boxes.""",
+    """- "empty": the inside of the square is blank white — no stroke at all.
+- "slash": one thin diagonal or straight line crosses the square (a hasty
+  tick often looks like this).
+- "check_x_or_scribble": a check mark, an X, or a scribble in the square;
+  ALSO use this when the item's text is struck through or crossed out,
+  whatever its checkbox looks like.
+Decide each checkbox on its own evidence; most boards contain a mix.""")
+
+
 def b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=95)
@@ -241,6 +276,11 @@ for n in range(runs):
     got = {b: [(i["text"], i["checkbox"] == "marked") for i in out.get(b, [])]
            for b in ("work", "personal")}
     score(f"V1 per-item checkbox  ({dt:4.1f}s)", got)
+
+    out, dt = call(V9_PROMPT, V9_SCHEMA, b64(img))
+    got = {b: [(i["text"], i["checkbox"] != "empty") for i in out.get(b, [])]
+           for b in ("work", "personal")}
+    score(f"V9 DEPLOYED mark-shapes ({dt:4.1f}s)", got)
 
     left = img.crop((0, 0, int(W * 0.64), H))
     right = img.crop((int(W * 0.62), 0, W, H))

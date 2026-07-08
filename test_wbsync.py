@@ -554,15 +554,16 @@ def test_manual_edits_land_in_history(tmp_path):
 def test_normalise_read_maps_checkbox_states_to_lists():
     raw = {
         "work": [{"text": "open item", "checkbox": "empty"},
-                 {"text": "ticked item", "checkbox": "marked"},
-                 {"text": "  ", "checkbox": "empty"},        # blank: dropped
+                 {"text": "slashed item", "checkbox": "slash"},
+                 {"text": "no box read"},                     # unknown -> open
+                 {"text": "  ", "checkbox": "empty"},         # blank: dropped
                  "garbage string",                            # junk: dropped
-                 {"checkbox": "marked"}],                     # no text: dropped
-        "personal": [{"text": "chore", "checkbox": "marked"}],
+                 {"checkbox": "slash"}],                      # no text: dropped
+        "personal": [{"text": "chore", "checkbox": "check_x_or_scribble"}],
         "work_obstructed": True,
     }
     assert normalise_read(raw) == {
-        "work": ["open item"], "work_done": ["ticked item"],
+        "work": ["open item", "no box read"], "work_done": ["slashed item"],
         "personal": [], "personal_done": ["chore"],
         "work_obstructed": True, "personal_obstructed": False,
     }
