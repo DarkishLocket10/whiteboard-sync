@@ -213,7 +213,10 @@ class Config:
             interval_s=int(env("WB_INTERVAL_S", "900")),
             change_threshold=float(env("WB_CHANGE_THRESHOLD", "4.0")),
             missing_to_complete=int(env("WB_MISSING_TO_COMPLETE", "2")),
-            ticked_to_complete=int(env("WB_TICKED_TO_COMPLETE", "1")),
+            # 2, not 1: a single-frame tick false positive was observed live
+            # (2026-07-08, "Pulse leaderboard update") — one misread frame
+            # must not complete a real task.
+            ticked_to_complete=int(env("WB_TICKED_TO_COMPLETE", "2")),
             scan_when_home=env("WB_SCAN_WHEN_HOME", "false").lower() in ("1", "true", "yes"),
             model=env("WB_MODEL", "qwen3-vl:8b-instruct"),
             data_dir=Path(env("WB_DATA_DIR", "/data")),
