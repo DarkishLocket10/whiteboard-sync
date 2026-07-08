@@ -41,14 +41,19 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   checkbox states right); the per-item schema scored 18/21 with only safe
   false negatives. A "describe the mark first" field flipped errors to
   false positives (whole board read as ticked) — also don't do that.
-- Reconcile guards, both bench-driven by real incidents from 2026-07-08
-  history: new items wait for `sightings_to_add` (default 2) consecutive
-  reads (a scan hallucinated "Buy cake"/"Call mom" into real Todoist tasks;
-  fragments of half-hidden lines became tasks), and a mass-erase guard
-  demands one extra miss when ≥4 items would absence-complete in one scan
-  while the board still shows other items (17 tasks were once falsely
-  completed by one garbage read). A real full-board wipe reads as an EMPTY
-  board and is not slowed. Change detection is bypassed while any item is
+- Reconcile guards, all driven by real incidents from 2026-07-08 history:
+  new items wait for `sightings_to_add` (default 2) consecutive reads (a
+  scan hallucinated "Buy cake"/"Call mom" into real Todoist tasks;
+  fragments of half-hidden lines became tasks); a mass-erase guard demands
+  one extra miss when ≥4 items would absence-complete in one scan while
+  the board still shows other items (17 tasks were once falsely completed
+  by one garbage read — a real full-board wipe reads as an EMPTY board and
+  is not slowed); and on an OBSTRUCTED board checkbox judgments are
+  ignored in BOTH directions (empty boxes read "marked" and vice versa,
+  varying frame to frame, when someone sits in front — item text is still
+  trusted there: it resets absence counters and accrues pending
+  sightings). Tick completions need `ticked_to_complete` (default 2)
+  consecutive CLEAR-board sightings. Change detection is bypassed while any item is
   pending, so sightings can accrue on an unchanged board.
 - Item edits belong on the dashboard, not in the JSON: the ✎/× buttons hit
   `POST /api/items/edit` (renames the Todoist task too, keeping state

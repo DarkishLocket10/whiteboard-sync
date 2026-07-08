@@ -366,15 +366,60 @@ def test_ticked_to_complete_guard(tmp_path):
     assert s.state["items"][-1]["ticked"] == 0
 
 
-def test_tick_completes_even_on_obstructed_board(tmp_path):
+def test_tick_on_obstructed_board_is_only_a_sighting(tmp_path):
+    """Checkbox reads flip randomly on obstructed frames (observed live
+    2026-07-08): a tick there must not complete, and must not create ghosts."""
     s = make_syncer(tmp_path)
     s.reconcile({"work": ["task"], "personal": []})
     s.ha.calls.clear()
     result = s.reconcile({"work": [], "work_done": ["task"], "personal": [],
                           "work_obstructed": True, "personal_obstructed": False})
-    assert result["protected"] == ["work"]
-    # a readable tick is presence, not absence — the guard doesn't apply
+    assert result["protected"] == ["work"] and result["completed"] == []
+    assert s.ha.calls == []
+    item = s.state["items"][0]
+    assert item["status"] == "open"
+    assert item["missing"] == 0        # the TEXT sighting still counts
+    assert item["ticked"] == 0         # ...but no tick streak accrues
+    # the same tick on a CLEAR frame completes normally
+    result = s.reconcile({"work": [], "work_done": ["task"], "personal": []})
     assert result["completed"] == ["task"]
+
+
+def test_obstructed_frames_freeze_tick_streak_both_ways(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"ticked_to_complete": 2})
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    s.reconcile({"work": [], "work_done": ["task"], "personal": []})  # clear tick 1
+    assert s.state["items"][0]["ticked"] == 1
+    # obstructed frame misreads it as open: streak must NOT reset
+    s.reconcile({"work": ["task"], "personal": [],
+                 "work_obstructed": True, "personal_obstructed": False})
+    assert s.state["items"][0]["ticked"] == 1
+    # next clear tick completes (2 trusted sightings total)
+    result = s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    assert result["completed"] == ["task"]
+
+
+def test_first_seen_ticked_on_obstructed_board_creates_no_ghost(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": [], "work_done": ["brand new"], "personal": [],
+                 "work_obstructed": True, "personal_obstructed": False})
+    assert s.state["items"] == []      # a false "marked" here would park a
+    # real item as done and its task would never be created
+    s.reconcile({"work": ["brand new"], "personal": []})
+    assert s.state["items"][0]["status"] == "open"   # clear read: tracked
+
+
+def test_pending_accrues_from_text_sighting_on_obstructed_board(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.reconcile({"work": ["new item"], "personal": []})
+    # obstructed frame misreads its checkbox as marked: the TEXT repeating is
+    # still confirmation — accrue; do NOT convert to done off an untrusted tick
+    s.reconcile({"work": [], "work_done": ["new item"], "personal": [],
+                 "work_obstructed": True, "personal_obstructed": False})
+    assert s.state["items"][0]["status"] == "open"
+    assert s.ha.calls[-1][:2] == ("todoist", "new_task")
 
 
 def test_dry_run_reports_tick_completions_without_touching(tmp_path):

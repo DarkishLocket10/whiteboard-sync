@@ -12,8 +12,10 @@ into Todoist via Home Assistant:
   after ``sightings_to_add`` consecutive reads (guards against OCR
   hallucinations and fragments of half-hidden lines becoming tasks)
 * Checkbox TICKED (check/X/fill) -> ``todo.update_item`` completes the task
-  after ``ticked_to_complete`` sightings (default 1); the item stays tracked
-  as "done" while it remains on the board so tick misreads can't re-add it
+  after ``ticked_to_complete`` sightings (default 2) on CLEAR reads — on an
+  obstructed board checkbox judgments are untrustworthy and are ignored in
+  both directions; the item stays tracked as "done" while it remains on the
+  board so tick misreads can't re-add it
 * Item ERASED                    -> after it has been missing for
   ``WB_MISSING_TO_COMPLETE`` consecutive scans, completed the same way
   (the guard absorbs one bad OCR read)
@@ -566,14 +568,22 @@ class Syncer:
         miss on a clear board drops a pending item, and one first seen
         ticked converts straight to "done" without ever creating a task.
 
+        On a PROTECTED board (flagged obstructed while the guard is on) the
+        checkbox judgment itself is untrusted — observed live 2026-07-08:
+        with a person in front of a board, empty boxes read "marked" and
+        marked boxes read "empty", varying frame to frame, while clear-board
+        reads were stable. Item TEXT is still trusted there (it resets
+        absence counters and accrues pending sightings), but tick streaks
+        freeze in both directions and no tick may complete a task.
+
         Completion signals, strongest first:
 
-        * A TICKED checkbox (the board's ``*_done`` list) is a positive,
-          directly-readable signal: the task completes after
-          ``ticked_to_complete`` consecutive sightings (default 1) — even on
-          an obstructed board. The item then stays tracked with status
-          "done" for as long as it remains on the board, so a later misread
-          of its tick can never re-create the task.
+        * A TICKED checkbox (the board's ``*_done`` list) on a CLEAR board:
+          the task completes after ``ticked_to_complete`` consecutive
+          sightings (default 2 — a single-frame misread must not complete a
+          real task). The item then stays tracked with status "done" for as
+          long as it remains on the board, so a later misread of its tick
+          can never re-create the task.
         * ABSENCE (in neither list) means erased — but only on a clear
           board. After ``missing_to_complete`` consecutive misses the task
           completes and the item is dropped. On a PROTECTED board (flagged
@@ -639,10 +649,13 @@ class Syncer:
                 match = fuzzy_match(text, known_texts)
                 if match is not None:
                     done_matched.add(match)
-                elif apply:
-                    # First seen already ticked: it was finished before we
-                    # ever tracked it — no Todoist task, but remember it so a
-                    # misread of its tick can't create one later.
+                elif apply and board not in protected:
+                    # First seen already ticked (on a TRUSTED read): it was
+                    # finished before we ever tracked it — no Todoist task,
+                    # but remember it so a misread of its tick can't create
+                    # one later. Never from a protected board: a false
+                    # "marked" there would park a real new item as done and
+                    # its task would never be created.
                     self.state["items"].append({"text": text, "board": board,
                                                 "status": "done", "missing": 0,
                                                 "ticked": 0})
@@ -665,7 +678,9 @@ class Syncer:
 
             for item in known:
                 sighted = item["text"] in open_matched or item["text"] in done_matched
-                ticked = item["text"] in done_matched
+                # A tick only counts as a tick on a clear board; on a
+                # protected board it degrades to a plain text sighting.
+                ticked = item["text"] in done_matched and board not in protected
 
                 if item["status"] == "pending":
                     # No Todoist task exists yet. Sightings must be
@@ -712,8 +727,7 @@ class Syncer:
                             self.state["items"].remove(item)
                     continue
 
-                if ticked:
-                    # Positive signal — honoured even on an obstructed board.
+                if ticked:  # trusted tick: clear board only
                     if not apply:
                         if item["ticked"] + 1 >= self.settings["ticked_to_complete"]:
                             completed.append(item["text"])
@@ -728,10 +742,15 @@ class Syncer:
                         else:
                             failed += 1
                     continue
-                if item["text"] in open_matched:
+                if sighted:
                     if apply:
                         item["missing"] = 0
-                        item["ticked"] = 0
+                        if board not in protected:
+                            # Read as open on a trusted frame: any tick
+                            # streak was a misread — reset it. On a protected
+                            # frame the streak freezes instead (the checkbox
+                            # judgment there proves nothing either way).
+                            item["ticked"] = 0
                     continue
                 # absent from both lists: erased, or hidden behind something
                 if board in protected:
