@@ -53,7 +53,17 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   varying frame to frame, when someone sits in front — item text is still
   trusted there: it resets absence counters and accrues pending
   sightings). Tick completions need `ticked_to_complete` (default 2)
-  consecutive CLEAR-board sightings. Change detection is bypassed while any item is
+  consecutive CLEAR-board sightings, and then a `tick_confirm` second
+  photo+read in the same scan that must agree (a transiently weird scene
+  — chair moved, lighting — once produced the SAME false tick on two
+  reads minutes apart while the board read unobstructed; streaks alone
+  can't stop correlated repeats). Disputed or unconfirmable ticks demote
+  to plain sightings — deferring a completion is always safe.
+- Model reads are NOT deterministic even at temperature 0 on an identical
+  image (marginal checkboxes flip between runs), and false-positive bursts
+  are scene-state-dependent, not image-enhancement-dependent (enhance
+  on/off benchmarked identical). Don't chase single-run bench results;
+  run multiple frames/runs and judge false positives strictly. Change detection is bypassed while any item is
   pending, so sightings can accrue on an unchanged board.
 - Item edits belong on the dashboard, not in the JSON: the ✎/× buttons hit
   `POST /api/items/edit` (renames the Todoist task too, keeping state

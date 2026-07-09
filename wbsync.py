@@ -79,6 +79,7 @@ SETTING_BOUNDS = {
     "missing_to_complete": (int, 1, 10),
     "ticked_to_complete": (int, 1, 10),  # tick sightings before completing
     "sightings_to_add": (int, 1, 10),    # reads a NEW item needs before its task is created
+    "tick_confirm": bool,                # re-photograph + re-read before tick completions
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
     "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
     "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
@@ -123,9 +124,12 @@ to-do list item. Erased items are not listed.
 A person or object may hide part of a board. Still transcribe every item you
 can actually read — NEVER return empty arrays just because a board is
 partially hidden. Read around the blockage.
-After transcribing, set "work_obstructed" to true if a person, chair, or any
-object hides ANY part of the LEFT board, and "personal_obstructed" to true if
-anything hides ANY part of the RIGHT board — otherwise false."""
+After transcribing, judge whether the ITEM LISTS themselves are blocked:
+set "work_obstructed" to true if a person or object hides or overlaps any of
+the LEFT board's written items, their checkboxes, or the space immediately
+around/between them — and "personal_obstructed" likewise for the RIGHT
+board. A person or object in front of BLANK board space, away from all the
+written items, does NOT count as obstruction — otherwise false."""
 
 _READ_ITEM = {
     "type": "object",
@@ -311,6 +315,37 @@ def fuzzy_match(needle: str, haystack: list[str]) -> Optional[str]:
     return best if best_ratio >= FUZZY_MATCH_RATIO else None
 
 
+def confirm_ticks(seen: dict, seen2: Optional[dict]) -> dict:
+    """Tick consensus between two independent reads of two fresh photos.
+    A tick survives only if BOTH reads saw it ticked; a tick the second
+    read disagrees with (or, when the second read failed entirely,
+    ``seen2 is None``, every tick) is demoted to an OPEN sighting — the
+    item still counts as present, it just earns no tick evidence this
+    scan. Texts stay canonical from the first read; obstruction flags OR.
+
+    This exists because tick false positives were observed to REPEAT
+    across consecutive reads of a transiently weird scene (2026-07-08,
+    ~23:20: an empty box read ticked on two captures minutes apart while
+    the board read unobstructed) — a per-scan streak alone cannot stop a
+    correlated repeat, but three agreeing misreads are much rarer."""
+    merged = dict(seen)
+    for board in ("work", "personal"):
+        done1 = merged.get(f"{board}_done", [])
+        if seen2 is None:
+            confirmed, demoted = [], list(done1)
+        else:
+            done2 = [t.strip() for t in seen2.get(f"{board}_done", []) if t.strip()]
+            confirmed = [t for t in done1 if fuzzy_match(t, done2)]
+            demoted = [t for t in done1 if t not in confirmed]
+        merged[f"{board}_done"] = confirmed
+        merged[board] = list(merged.get(board, [])) + demoted
+        if seen2 is not None:
+            merged[f"{board}_obstructed"] = bool(
+                merged.get(f"{board}_obstructed")
+                or seen2.get(f"{board}_obstructed"))
+    return merged
+
+
 class Syncer:
     def __init__(self, cfg: Config, ha: HomeAssistant, reader):
         self.cfg = cfg
@@ -355,6 +390,7 @@ class Syncer:
             "missing_to_complete": cfg.missing_to_complete,
             "ticked_to_complete": cfg.ticked_to_complete,
             "sightings_to_add": 2,
+            "tick_confirm": True,
             "capture_frames": 8,
             "capture_quality": 92,
             "upscale": 1,
@@ -798,6 +834,23 @@ class Syncer:
             result["took_s"] = round(time.monotonic() - t0, 1)
             return self._done(result)
 
+    def _tick_completion_imminent(self, seen: dict) -> bool:
+        """Would reconciling ``seen`` complete a task via its ticks?"""
+        guard = self.settings["obstruction_guard"]
+        need = self.settings["ticked_to_complete"]
+        for board in ("work", "personal"):
+            if guard and seen.get(f"{board}_obstructed"):
+                continue  # protected: ticks are ignored there anyway
+            done = [t.strip() for t in seen.get(f"{board}_done", []) if t.strip()]
+            if not done:
+                continue
+            for item in self.state["items"]:
+                if (item["board"] == board and item["status"] == "open"
+                        and item["ticked"] + 1 >= need
+                        and fuzzy_match(item["text"], done)):
+                    return True
+        return False
+
     def _scan_inner(self, force: bool, dry: bool) -> dict:
         try:
             jpeg, gray = self._fetch_crop()
@@ -818,6 +871,20 @@ class Syncer:
         except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
             log.warning("board read failed: %s", exc)
             return {"ok": False, "error": f"read failed: {exc}", **base}
+        if (not dry and self.settings["tick_confirm"]
+                and self._tick_completion_imminent(seen)):
+            # About to complete a task off this read's ticks: re-photograph
+            # and re-read, keeping only ticks BOTH reads agree on (see
+            # confirm_ticks). A failed second read demotes every tick to an
+            # open sighting — deferring a completion is always safe.
+            seen2 = None
+            try:
+                jpeg2, _ = self._fetch_crop()
+                seen2 = self.reader.read(jpeg2)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("tick-confirm read failed (%s); ticks deferred", exc)
+            seen = confirm_ticks(seen, seen2)
+            base["tick_confirmed"] = seen2 is not None
         blocked = [b for b in ("work", "personal") if seen.get(f"{b}_obstructed")]
         if blocked:
             base["obstructed"] = blocked
@@ -1109,6 +1176,8 @@ function outcome(r) {
     s += ' (' + r.obstructed.join(' + ') + ' board blocked — completions deferred)';
   if (Array.isArray(r.slowed) && r.slowed.length)
     s += ' (mass-erase guard: ' + r.slowed.join(' + ') + ' completions slowed)';
+  if (r.tick_confirmed === false)
+    s += ' (confirm photo failed — tick completions deferred)';
   if (r.obstructed_ignored) s += ' (obstruction ignored)';               // legacy
   if (r.failed) s += ' (' + r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry)';
   return s;
@@ -1133,6 +1202,7 @@ const SETTINGS_UI = [
   ['missing_to_complete', 'num', 'Misses to complete', { min: 1, max: 10, step: 1 }],
   ['ticked_to_complete', 'num', 'Ticks to complete', { min: 1, max: 10, step: 1 }],
   ['sightings_to_add', 'num', 'Sightings to create task', { min: 1, max: 10, step: 1 }],
+  ['tick_confirm', 'bool', 'Confirm ticks (2nd photo)'],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
   ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
   ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],

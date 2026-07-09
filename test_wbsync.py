@@ -3,7 +3,8 @@ import json
 
 import pytest
 
-from wbsync import Config, Syncer, fuzzy_match, normalise_read, parse_region
+from wbsync import (Config, Syncer, confirm_ticks, fuzzy_match,
+                    normalise_read, parse_region)
 
 
 class FakeHA:
@@ -680,6 +681,107 @@ def test_resighting_after_garbage_read_resets_cleanly(tmp_path):
     assert all(i["missing"] == 0 for i in s.state["items"])
     assert [c for c in s.ha.calls if c[1] == "update_item"] == []
     assert len(s.state["items"]) == 5                # fabrications died as pending
+
+
+# -- tick confirmation (second photo before completing) ---------------------
+
+class SeqReader:
+    """Returns queued reads in order; raises when the queue is empty."""
+    def __init__(self, seens):
+        self.seens = list(seens)
+        self.calls = 0
+
+    def read(self, jpeg):
+        self.calls += 1
+        nxt = self.seens.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+def test_confirm_ticks_keeps_agreed_demotes_disputed():
+    seen = {"work": ["open item"], "work_done": ["agreed", "disputed"],
+            "personal": [], "personal_done": [],
+            "work_obstructed": False, "personal_obstructed": False}
+    merged = confirm_ticks(seen, {"work": [], "work_done": ["agreed!"],  # OCR wobble
+                                  "personal": [], "personal_done": [],
+                                  "work_obstructed": False,
+                                  "personal_obstructed": True})
+    assert merged["work_done"] == ["agreed"]        # canonical text from read 1
+    assert merged["work"] == ["open item", "disputed"]  # demoted to a sighting
+    assert merged["personal_obstructed"] is True    # obstruction flags OR
+
+
+def test_confirm_ticks_failed_second_read_demotes_everything():
+    seen = {"work": [], "work_done": ["task"], "personal": [],
+            "personal_done": [], "work_obstructed": False,
+            "personal_obstructed": False}
+    merged = confirm_ticks(seen, None)
+    assert merged["work_done"] == [] and merged["work"] == ["task"]
+
+
+def confirm_syncer(tmp_path, reads):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    s.reader = SeqReader(reads)
+    fake_fetch(s)
+    return s
+
+
+TICKED = {"work": [], "work_done": ["task"], "personal": [],
+          "work_obstructed": False, "personal_obstructed": False}
+OPEN = {"work": ["task"], "personal": [],
+        "work_obstructed": False, "personal_obstructed": False}
+
+
+def test_imminent_tick_completion_triggers_confirm_read(tmp_path):
+    s = confirm_syncer(tmp_path, [TICKED, TICKED])
+    result = s.scan(force=True)
+    assert s.reader.calls == 2                       # confirm read happened
+    assert result["completed"] == ["task"]           # both reads agree
+
+
+def test_disputed_tick_defers_completion(tmp_path):
+    s = confirm_syncer(tmp_path, [TICKED, OPEN])
+    result = s.scan(force=True)
+    assert s.reader.calls == 2
+    assert result["completed"] == [] and s.ha.calls == []
+    assert s.state["items"][0]["status"] == "open"
+    assert s.state["items"][0]["missing"] == 0       # still counts as sighted
+
+
+def test_failed_confirm_read_defers_completion(tmp_path):
+    s = confirm_syncer(tmp_path, [TICKED, RuntimeError("model hiccup")])
+    result = s.scan(force=True)
+    assert result["ok"] is True                      # scan itself survives
+    assert result["tick_confirmed"] is False
+    assert result["completed"] == [] and s.ha.calls == []
+
+
+def test_no_confirm_read_when_nothing_would_complete(tmp_path):
+    s = confirm_syncer(tmp_path, [OPEN])
+    s.update_settings({"ticked_to_complete": 2})
+    s.reader.seens = [TICKED]                        # tick 1 of 2: not imminent
+    result = s.scan(force=True)
+    assert s.reader.calls == 1                       # single read only
+    assert result["completed"] == []
+    assert s.state["items"][0]["ticked"] == 1
+
+
+def test_confirm_read_can_be_disabled(tmp_path):
+    s = confirm_syncer(tmp_path, [TICKED])
+    s.update_settings({"tick_confirm": False})
+    result = s.scan(force=True)
+    assert s.reader.calls == 1
+    assert result["completed"] == ["task"]
+
+
+def test_dry_run_never_takes_a_confirm_read(tmp_path):
+    s = confirm_syncer(tmp_path, [TICKED])
+    result = s.scan(force=True, dry=True)
+    assert s.reader.calls == 1
+    assert result["completed"] == ["task"] and s.ha.calls == []
 
 
 def test_true_board_wipe_still_completes_at_normal_threshold(tmp_path):
