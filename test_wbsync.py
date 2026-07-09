@@ -116,7 +116,8 @@ def test_state_persists_across_restarts(tmp_path):
     s.reconcile({"work": ["Fix dashboard"], "personal": []})
     reloaded = make_syncer(tmp_path)
     assert reloaded.state["items"] == [{"text": "Fix dashboard", "board": "work",
-                                        "status": "open", "missing": 0, "ticked": 0}]
+                                        "status": "open", "missing": 0,
+                                        "ticked": 0, "pos": 0}]
 
 
 def test_legacy_state_migrates_to_open_status(tmp_path):
@@ -290,7 +291,8 @@ def test_boards_are_reconciled_independently(tmp_path):
     completed = [c for c in s.ha.calls if c[1] == "update_item"]
     assert len(completed) == 1
     assert s.state["items"] == [{"text": "call mom", "board": "personal",
-                                 "status": "open", "missing": 0, "ticked": 0}]
+                                 "status": "open", "missing": 0, "ticked": 0,
+                                 "pos": 0}]
 
 
 def test_new_tasks_get_due_today_unless_disabled(tmp_path):
@@ -633,9 +635,61 @@ def test_normalise_read_maps_checkbox_states_to_lists():
     }
     assert normalise_read(raw) == {
         "work": ["open item", "no box read"], "work_done": ["slashed item"],
+        "work_order": ["open item", "slashed item", "no box read"],
         "personal": [], "personal_done": ["chore"],
+        "personal_order": ["chore"],
         "work_obstructed": True, "personal_obstructed": False,
     }
+
+
+# -- board order --------------------------------------------------------------
+
+def test_items_carry_their_position_on_the_board(tmp_path):
+    s = make_syncer(tmp_path)
+    # board top-to-bottom: alpha (open), beta (ticked), gamma (open) —
+    # the split open/done lists alone would lose beta's middle position
+    s.reconcile({"work": ["alpha task", "gamma chore"],
+                 "work_done": ["beta errand"],
+                 "work_order": ["alpha task", "beta errand", "gamma chore"],
+                 "personal": []})
+    by_text = {i["text"]: i["pos"] for i in s.state["items"]}
+    assert by_text == {"alpha task": 0, "beta errand": 1, "gamma chore": 2}
+
+
+def test_positions_restamp_when_the_board_is_rewritten(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["alpha task", "gamma chore"], "personal": []})
+    # rewritten in the opposite order (fuzzy text wobble included)
+    s.reconcile({"work": ["gamma chore!", "alpha task"],
+                 "work_order": ["gamma chore!", "alpha task"],
+                 "personal": []})
+    by_text = {i["text"]: i["pos"] for i in s.state["items"]}
+    assert by_text == {"gamma chore": 0, "alpha task": 1}
+
+
+def test_positions_are_per_board_and_survive_reload(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["work thing"], "personal": ["personal thing"]})
+    assert all(i["pos"] == 0 for i in s.state["items"])  # independent boards
+    reloaded = make_syncer(tmp_path)
+    assert all(i["pos"] == 0 for i in reloaded.state["items"])
+
+
+def test_legacy_items_without_pos_keep_file_order(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps({"items": [
+        {"text": "first", "board": "work", "missing": 0},
+        {"text": "second", "board": "work", "missing": 0}]}))
+    s = make_syncer(tmp_path)
+    assert [i["pos"] for i in s.state["items"]] == [0, 1]
+
+
+def test_dry_run_does_not_touch_positions(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["alpha task", "gamma chore"], "personal": []})
+    s.reconcile({"work": ["gamma chore", "alpha task"], "personal": []},
+                apply=False)
+    by_text = {i["text"]: i["pos"] for i in s.state["items"]}
+    assert by_text == {"alpha task": 0, "gamma chore": 1}  # unchanged
 
 
 # -- sighting streak for new items ------------------------------------------
@@ -647,7 +701,7 @@ def test_new_item_needs_two_sightings_before_task_created(tmp_path):
     assert s.ha.calls == []                          # nothing hit Todoist yet
     assert s.state["items"][0] == {"text": "real new item", "board": "work",
                                    "status": "pending", "missing": 0,
-                                   "ticked": 0, "seen": 1}
+                                   "ticked": 0, "seen": 1, "pos": 0}
     r2 = s.reconcile({"work": ["real new item"], "personal": []})
     assert r2["added"] == ["real new item"] and r2["pending"] == []
     assert s.ha.calls[-1][:2] == ("todoist", "new_task")

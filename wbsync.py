@@ -160,11 +160,14 @@ READ_SCHEMA = {
 def normalise_read(raw: dict) -> dict:
     """Model output -> the reconciler's shape: {"work": [open texts],
     "work_done": [ticked texts], ..., "*_obstructed": bool}. Tolerates junk
-    entries (non-dict items, blank text) rather than failing the scan."""
+    entries (non-dict items, blank text) rather than failing the scan.
+    ``{board}_order`` keeps the model's top-to-bottom transcription order
+    with open and done interleaved — the split lists lose it, and the
+    dashboard sorts items by their position on the physical board."""
     seen = {"work_obstructed": bool(raw.get("work_obstructed")),
             "personal_obstructed": bool(raw.get("personal_obstructed"))}
     for board in ("work", "personal"):
-        open_, done = [], []
+        open_, done, order = [], [], []
         for entry in raw.get(board) or []:
             if not isinstance(entry, dict):
                 continue
@@ -175,8 +178,10 @@ def normalise_read(raw: dict) -> dict:
                 box = entry.get("checkbox") or "empty"
                 (done if box in ("slash", "check_x_or_scribble") else open_
                  ).append(text)
+                order.append(text)
         seen[board] = open_
         seen[f"{board}_done"] = done
+        seen[f"{board}_order"] = order
     return seen
 
 
@@ -360,9 +365,12 @@ class Syncer:
         self.state: dict = {"items": []}  # [{text, board, status, missing, ticked}]
         if self._state_path.is_file():
             self.state = json.loads(self._state_path.read_text())
-        for item in self.state["items"]:  # migrate pre-checkmark state files
+        for idx, item in enumerate(self.state["items"]):  # migrate old state files
             item.setdefault("status", "open")
             item.setdefault("ticked", 0)
+            # board position; refreshed from the next processed read's
+            # top-to-bottom order — until then, keep today's display order
+            item.setdefault("pos", idx)
         # items_view is what HTTP threads serve: a snapshot swapped whole, so
         # a scan mutating self.state mid-serialisation can't tear a response.
         self.items_view: list[dict] = [dict(i) for i in self.state["items"]]
@@ -701,18 +709,29 @@ class Syncer:
             known = [i for i in self.state["items"] if i["board"] == board]
             known_texts = [i["text"] for i in known]
 
+            # top-to-bottom position of each seen text on the board this
+            # read; tracked items get restamped every time they're sighted
+            # so the dashboard mirrors the physical board's order
+            order_idx: dict[str, int] = {}
+            for i, t in enumerate(seen.get(f"{board}_order",
+                                           seen_open + seen_done)):
+                order_idx.setdefault(t.strip(), i)
+            pos_seen: dict[str, int] = {}  # canonical text -> board position
+
             open_matched, done_matched = set(), set()
             for text in seen_open:
                 match = fuzzy_match(text, known_texts)
                 if match is not None:
                     open_matched.add(match)  # keep canonical text (= Todoist summary)
+                    pos_seen[match] = order_idx.get(text, len(order_idx))
                     continue
                 if need_seen > 1:
                     pending.append(text)
                     if apply:
                         self.state["items"].append(
                             {"text": text, "board": board, "status": "pending",
-                             "missing": 0, "ticked": 0, "seen": 1})
+                             "missing": 0, "ticked": 0, "seen": 1,
+                             "pos": order_idx.get(text, len(order_idx))})
                         known_texts.append(text)  # no same-scan duplicate pendings
                     continue
                 if not apply:
@@ -721,7 +740,8 @@ class Syncer:
                 if self._push_task(text, board):
                     self.state["items"].append({"text": text, "board": board,
                                                 "status": "open", "missing": 0,
-                                                "ticked": 0})
+                                                "ticked": 0,
+                                                "pos": order_idx.get(text, len(order_idx))})
                     known_texts.append(text)
                     added.append(text)
                 else:
@@ -730,6 +750,7 @@ class Syncer:
                 match = fuzzy_match(text, known_texts)
                 if match is not None:
                     done_matched.add(match)
+                    pos_seen[match] = order_idx.get(text, len(order_idx))
                 elif apply and board not in protected:
                     # First seen already ticked (on a TRUSTED read): it was
                     # finished before we ever tracked it — no Todoist task,
@@ -739,8 +760,13 @@ class Syncer:
                     # its task would never be created.
                     self.state["items"].append({"text": text, "board": board,
                                                 "status": "done", "missing": 0,
-                                                "ticked": 0})
+                                                "ticked": 0,
+                                                "pos": order_idx.get(text, len(order_idx))})
                     known_texts.append(text)
+            if apply:
+                for item in known:
+                    if item["text"] in pos_seen:
+                        item["pos"] = pos_seen[item["text"]]
 
             # Mass-erase guard (see docstring): completing many items by
             # absence in one read, while the read still shows other items,
@@ -1335,7 +1361,8 @@ function render() {
 
   for (const board of ['work', 'personal']) {
     const ul = $('list-' + board); ul.textContent = '';
-    const rows = items.filter((i) => i.board === board);
+    const rows = items.filter((i) => i.board === board)
+      .sort((a, b) => (a.pos ?? 1e9) - (b.pos ?? 1e9));  // as written on the board
     if (!rows.length) { ul.appendChild(el('li', 'empty', 'nothing tracked')); continue; }
     for (const it of rows) {
       const li = el('li', it.status === 'done' || it.status === 'removed' ? 'done' : null);
