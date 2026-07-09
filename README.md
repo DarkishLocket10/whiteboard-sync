@@ -12,7 +12,7 @@ the house, zero marginal cost per scan.
 
 There are two boards side by side: the **left board is work**, the **right
 board is personal**. Tasks created from them land in Todoist tagged
-`whiteboard` + `work` / `personal`.
+`work` / `personal` (orange / purple).
 
 A built-in dashboard (below) shows exactly what the service is doing and lets
 you flip every behaviour at runtime.

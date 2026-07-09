@@ -7,7 +7,7 @@ Reads the two office whiteboards through **kinect-knob's** camera
 (`GET :8420/api/snapshot`, full-res unmirrored 1080p) every 15 min while
 the user is away, transcribes open items with a local qwen3-vl model via Ollama, and syncs
 them to Todoist via Home Assistant. Left board = work, right = personal;
-new items → `todoist.new_task` (labels `whiteboard` + board); erased or
+new items → `todoist.new_task` (label `work` / `personal`); erased or
 checked items → `todo.update_item` completed after 2 consecutive misses.
 
 ## The change → deploy loop

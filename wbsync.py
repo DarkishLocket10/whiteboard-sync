@@ -6,8 +6,8 @@ local Ollama vision model transcribe the open items (zero marginal cost,
 fully private — chosen because scans run frequently), and reconciles them
 into Todoist via Home Assistant:
 
-* LEFT board  -> work items,     tagged ["whiteboard", "work"]
-* RIGHT board -> personal items, tagged ["whiteboard", "personal"]
+* LEFT board  -> work items,     tagged ["work"]
+* RIGHT board -> personal items, tagged ["personal"]
 * New item on a board            -> ``todoist.new_task`` into the Inbox,
   after ``sightings_to_add`` consecutive reads (guards against OCR
   hallucinations and fragments of half-hidden lines becoming tasks)
@@ -643,7 +643,7 @@ class Syncer:
         task = {
             "content": text,
             "project": self.cfg.todoist_project,
-            "labels": ["whiteboard", board],
+            "labels": [board],  # just "work" / "personal" (user preference)
         }
         if self.settings["due_today"]:
             # Todoist parses this in the ACCOUNT's timezone — safer

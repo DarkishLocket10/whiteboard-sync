@@ -68,8 +68,8 @@ def test_new_items_create_tagged_todoist_tasks(tmp_path):
     assert sorted(result["added"]) == ["Fix dashboard", "do laundry"]
     tasks = [c for c in s.ha.calls if c[:2] == ("todoist", "new_task")]
     assert {t[2]["content"]: t[2]["labels"] for t in tasks} == {
-        "Fix dashboard": ["whiteboard", "work"],
-        "do laundry": ["whiteboard", "personal"],
+        "Fix dashboard": ["work"],
+        "do laundry": ["personal"],
     }
 
 
@@ -563,7 +563,7 @@ def test_reopen_done_item_creates_fresh_task_and_reopens(tmp_path):
     assert code == 200 and body["ok"]
     assert s.ha.calls == [("todoist", "new_task", {
         "content": "task", "project": "Inbox",
-        "labels": ["whiteboard", "work"], "due_date_string": "today",
+        "labels": ["work"], "due_date_string": "today",
     })]
     item = s.state["items"][0]
     assert item["status"] == "open" and item["ticked"] == 0 and item["missing"] == 0
