@@ -74,7 +74,14 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   image (marginal checkboxes flip between runs), and false-positive bursts
   are scene-state-dependent, not image-enhancement-dependent (enhance
   on/off benchmarked identical). Don't chase single-run bench results;
-  run multiple frames/runs and judge false positives strictly. Change detection is bypassed while any item is
+  run multiple frames/runs and judge false positives strictly.
+- Marker-COLOUR detection was benchmarked 2026-07-09 and NOT shipped: a
+  per-item colour enum after the checkbox field is checkbox-safe (77/84,
+  0 FP unchanged), but the Kinect renders ink nearly desaturated — black
+  reads 100%, red ~50%, blue ~25%, green/purple ~0% (they read
+  blue/black). Boosting saturation before the model lifts colour to
+  ~68/84 but WRECKS tick detection (8–11 false positives) — never apply
+  saturation/colour enhancement to the image the checkbox read uses. Change detection is bypassed while any item is
   pending, so sightings can accrue on an unchanged board.
 - Item edits belong on the dashboard, not in the JSON: the ✎/↩/× buttons
   hit `POST /api/items/edit` (renames the Todoist task too, keeping state
