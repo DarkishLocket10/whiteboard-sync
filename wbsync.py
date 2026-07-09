@@ -69,6 +69,18 @@ MASS_ERASE_MIN = 4
 # window > 0 covers detection lag (a tick missed on its change frame and
 # first read a scan or two later).
 TICK_START_CHANGE_WINDOW = 2
+# Low light (mean crop luminance, 0-255; measured 2026-07-09: lit office
+# ~140, office at night with residual light ~31). The Kinect exposes no
+# exposure control (freenect2 binding has none — long exposures are
+# impossible), so frame STACKING is the synthetic long exposure: at
+# luminance ~31 a single frame read garbled text and called almost every
+# checkbox ticked, while a 32-frame stack transcribed perfectly. Even
+# stacked, dark-frame CHECKBOX judgments stay completion-grade unreliable,
+# and a pitch-black frame reads as an EMPTY board — which absence logic
+# would treat as a real wipe.
+DIM_LUMA = 55        # below: stack LOWLIGHT_FRAMES + defer all completions
+DARK_LUMA = 18       # below: unreadable — skip the scan entirely
+LOWLIGHT_FRAMES = 32
 HISTORY_KEEP = 400  # scan/skip records kept in memory and in data/history.jsonl
 
 # Runtime-tunable settings (dashboard toggles, persisted in data/settings.json;
@@ -86,6 +98,7 @@ SETTING_BOUNDS = {
     "ticked_to_complete": (int, 1, 10),  # tick sightings before completing
     "sightings_to_add": (int, 1, 10),    # reads a NEW item needs before its task is created
     "tick_confirm": bool,                # re-photograph + re-read before tick completions
+    "low_light_boost": bool,             # dim frame -> re-capture with a 32-frame stack
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
     "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
     "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
@@ -406,6 +419,7 @@ class Syncer:
             "ticked_to_complete": cfg.ticked_to_complete,
             "sightings_to_add": 2,
             "tick_confirm": True,
+            "low_light_boost": True,
             "capture_frames": 8,
             "capture_quality": 92,
             "upscale": 1,
@@ -585,15 +599,16 @@ class Syncer:
             self._lock.release()
 
     # -- imaging --------------------------------------------------------
-    def _fetch_crop(self) -> tuple[bytes, np.ndarray]:
+    def _fetch_crop(self, frames: Optional[int] = None) -> tuple[bytes, np.ndarray]:
         s = self.settings
+        n = frames or s["capture_frames"]
         # Ask kinect-knob for a stacked, losslessly-encoded photo; an older
         # kinect-knob simply ignores unknown params and returns its JPEG.
         params = {"format": "png"}
-        if s["capture_frames"] > 1:
-            params["frames"] = s["capture_frames"]
+        if n > 1:
+            params["frames"] = n
         r = requests.get(f"{self.cfg.kinect_url}/api/snapshot", params=params,
-                         timeout=15 + 2 * s["capture_frames"])
+                         timeout=15 + 2 * n)
         r.raise_for_status()
         img = Image.open(io.BytesIO(r.content))
         crop = img.crop(self.cfg.region).convert("RGB")
@@ -659,7 +674,7 @@ class Syncer:
         })
 
     def reconcile(self, seen: dict, apply: bool = True,
-                  tick_start_ok: bool = True) -> dict:
+                  tick_start_ok: bool = True, distrust: bool = False) -> dict:
         """Diff OCR results against known state. With ``apply`` (the default),
         push adds/completions to HA and persist; with ``apply=False`` (dry
         run) just report what WOULD happen, touching nothing.
@@ -713,8 +728,11 @@ class Syncer:
           and manually-removed items are purged (no HA call) once they've
           been erased for ``missing_to_complete`` scans."""
         guard = self.settings["obstruction_guard"]
+        # ``distrust`` (dim frame) protects BOTH boards regardless of the
+        # obstruction guard toggle: text sightings still keep items alive,
+        # but nothing may complete off a low-light read.
         protected = [b for b in ("work", "personal")
-                     if guard and seen.get(f"{b}_obstructed")]
+                     if distrust or (guard and seen.get(f"{b}_obstructed"))]
         need_seen = self.settings["sightings_to_add"]
         base_miss = self.settings["missing_to_complete"]
         added, completed, pending, slowed, failed = [], [], [], [], 0
@@ -943,8 +961,26 @@ class Syncer:
         except requests.RequestException as exc:
             return {"ok": False, "error": f"snapshot failed: {exc}"}
         s = self.settings
+        luma = float(gray.mean())
+        if (luma < DIM_LUMA and s["low_light_boost"]
+                and s["capture_frames"] < LOWLIGHT_FRAMES):
+            # Synthetic long exposure: the Kinect has no exposure control,
+            # but averaging 32 frames buys the same noise reduction. At
+            # night this is the difference between garbled text with almost
+            # every box read ticked and a near-perfect transcription.
+            try:
+                jpeg, gray = self._fetch_crop(frames=LOWLIGHT_FRAMES)
+                luma = float(gray.mean())
+            except requests.RequestException as exc:
+                log.warning("low-light re-capture failed, using first: %s", exc)
+        base = {"luma": round(luma)}
+        if luma < DARK_LUMA:
+            # Unreadable. NEVER reconcile a black frame: it reads as an
+            # empty board, which absence logic would complete as a wipe.
+            return {"ok": True, "changed": False, "dark": True, **base}
+        dim = luma < DIM_LUMA
         diff = self._diff_score(gray)
-        base = {"diff": None if diff is None else round(diff, 2)}
+        base["diff"] = None if diff is None else round(diff, 2)
         if diff is None or diff >= s["change_threshold"]:
             self.scans_since_change = 0
         else:
@@ -961,7 +997,7 @@ class Syncer:
         except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
             log.warning("board read failed: %s", exc)
             return {"ok": False, "error": f"read failed: {exc}", **base}
-        if (not dry and self.settings["tick_confirm"]
+        if (not dry and not dim and self.settings["tick_confirm"]
                 and self._tick_completion_imminent(seen)):
             # About to complete a task off this read's ticks: re-photograph
             # and re-read, keeping only ticks BOTH reads agree on (see
@@ -978,9 +1014,12 @@ class Syncer:
         blocked = [b for b in ("work", "personal") if seen.get(f"{b}_obstructed")]
         if blocked:
             base["obstructed"] = blocked
+        if dim:
+            base["dim"] = True
         result = self.reconcile(
             seen, apply=not dry,
-            tick_start_ok=self.scans_since_change <= TICK_START_CHANGE_WINDOW)
+            tick_start_ok=self.scans_since_change <= TICK_START_CHANGE_WINDOW,
+            distrust=dim)
         if not dry and not result["failed"]:
             # A failed HA push means an item is not yet in Todoist; keeping
             # the old baseline forces a re-read (and a retry) next interval.
@@ -1258,6 +1297,7 @@ function outcome(r) {
   if (r.type === 'skip') return r.reason === 'home'
     ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
+  if (r.dark) return 'too dark to read (luma ' + r.luma + ') — skipped';
   if (r.obstructed === true) return 'board obstructed — left alone';  // legacy records
   if (r.changed === false) return 'no change';
   const a = (r.added || []).length, c = (r.completed || []).length;
@@ -1271,6 +1311,7 @@ function outcome(r) {
     s += ' (mass-erase guard: ' + r.slowed.join(' + ') + ' completions slowed)';
   if (r.tick_confirmed === false)
     s += ' (confirm photo failed — tick completions deferred)';
+  if (r.dim) s += ' (low light: 32-frame stack, completions deferred)';
   if (r.obstructed_ignored) s += ' (obstruction ignored)';               // legacy
   if (r.failed) s += ' (' + r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry)';
   return s;
@@ -1296,6 +1337,7 @@ const SETTINGS_UI = [
   ['ticked_to_complete', 'num', 'Ticks to complete', { min: 1, max: 10, step: 1 }],
   ['sightings_to_add', 'num', 'Sightings to create task', { min: 1, max: 10, step: 1 }],
   ['tick_confirm', 'bool', 'Confirm ticks (2nd photo)'],
+  ['low_light_boost', 'bool', 'Low light: stack 32 frames'],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
   ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
   ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],

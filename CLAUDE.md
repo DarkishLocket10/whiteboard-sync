@@ -75,6 +75,16 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   are scene-state-dependent, not image-enhancement-dependent (enhance
   on/off benchmarked identical). Don't chase single-run bench results;
   run multiple frames/runs and judge false positives strictly.
+- Low light (the Kinect exposes NO exposure control — freenect2 binding
+  has none, so true long exposures are impossible): frame stacking is the
+  synthetic long exposure. Measured 2026-07-09 ~02:50 (luma ~31 vs ~140
+  lit): a single frame garbled text and read almost every box ticked; a
+  32-frame stack transcribed near-perfectly but checkbox judgments stayed
+  completion-grade unreliable. Hence: dim frames (luma < DIM_LUMA) auto
+  re-capture with 32 frames and reconcile with BOTH boards protected
+  (regardless of the obstruction_guard toggle); pitch-dark frames
+  (< DARK_LUMA) skip entirely — a black frame reads as an EMPTY board,
+  which absence logic would complete as a full wipe.
 - Marker-COLOUR detection was benchmarked 2026-07-09 and NOT shipped: a
   per-item colour enum after the checkbox field is checkbox-safe (77/84,
   0 FP unchanged), but the Kinect renders ink nearly desaturated — black

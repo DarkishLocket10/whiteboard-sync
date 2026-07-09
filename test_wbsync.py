@@ -29,9 +29,12 @@ class FixedReader:
         return self.seen
 
 
-def fake_fetch(syncer):
+def fake_fetch(syncer, luma=150.0):
+    """Stub the camera with a well-lit constant frame (dark frames are
+    skipped and dim ones distrusted — see DARK_LUMA / DIM_LUMA)."""
     import numpy as np
-    syncer._fetch_crop = lambda: (b"jpeg", np.zeros((5, 5), dtype=np.float32))
+    syncer._fetch_crop = lambda frames=None: (
+        b"jpeg", np.full((5, 5), luma, dtype=np.float32))
 
 
 def make_syncer(tmp_path, missing_to_complete=2, sightings_to_add=1):
@@ -827,11 +830,75 @@ def test_scan_loop_tracks_scene_staleness(tmp_path):
     assert result["completed"] == []                 # blocked: cannot start
     assert s.state["items"][0]["ticked"] == 0
     # now the frame actually changes: the tick may start and complete
-    import numpy as np
-    s._fetch_crop = lambda: (b"jpeg", np.full((5, 5), 50, dtype=np.float32))
+    fake_fetch(s, luma=120.0)
     result = s.scan(force=True)
     assert s.scans_since_change == 0
     assert result["completed"] == ["task"]
+
+
+# -- low light -----------------------------------------------------------------
+
+def test_pitch_dark_frames_never_reconcile(tmp_path):
+    """A black frame reads as an empty board — absence logic would complete
+    everything as a wipe. Dark scans must skip before reading anything."""
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reader = SeqReader([])                  # any read attempt would blow up
+    fake_fetch(s, luma=5.0)
+    result = s.scan(force=True)
+    assert result["ok"] is True and result["dark"] is True
+    assert s.reader.calls == 0
+    assert s.state["items"][0]["missing"] == 0
+
+
+def test_dim_frames_boost_stack_and_defer_completions(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    fetches = []
+    import numpy as np
+
+    def fetch(frames=None):
+        fetches.append(frames)
+        return b"jpeg", np.full((5, 5), 30, dtype=np.float32)
+
+    s._fetch_crop = fetch
+    s.reader = SeqReader([TICKED])
+    result = s.scan(force=True)
+    assert fetches == [None, 32]              # low-light re-capture happened
+    assert result["dim"] is True and result["luma"] == 30
+    assert result["completed"] == [] and s.ha.calls == []   # distrusted
+    assert s.reader.calls == 1                # ...and no confirm read either
+    item = s.state["items"][0]
+    assert item["ticked"] == 0 and item["missing"] == 0     # text still counts
+
+
+def test_dim_absence_counts_no_misses_even_with_guard_off(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"obstruction_guard": False, "missing_to_complete": 1})
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    result = s.reconcile({"work": [], "personal": []}, distrust=True)
+    assert result["completed"] == [] and s.ha.calls == []
+    assert s.state["items"][0]["missing"] == 0
+
+
+def test_low_light_boost_can_be_disabled(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"low_light_boost": False})
+    s.reconcile({"work": ["task"], "personal": []})
+    fetches = []
+    import numpy as np
+
+    def fetch(frames=None):
+        fetches.append(frames)
+        return b"jpeg", np.full((5, 5), 30, dtype=np.float32)
+
+    s._fetch_crop = fetch
+    s.reader = SeqReader([OPEN])
+    result = s.scan(force=True)
+    assert fetches == [None]                  # no re-capture
+    assert result["dim"] is True              # but reads stay distrusted
 
 
 # -- mass-erase guard --------------------------------------------------------
