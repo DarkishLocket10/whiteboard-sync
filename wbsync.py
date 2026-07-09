@@ -81,6 +81,22 @@ TICK_START_CHANGE_WINDOW = 2
 DIM_LUMA = 55        # below: stack LOWLIGHT_FRAMES + defer all completions
 DARK_LUMA = 18       # below: unreadable — skip the scan entirely
 LOWLIGHT_FRAMES = 32
+# Depth guard: kinect-knob's /api/region_depth (self-illuminated ToF, aligned
+# to the color frame) says whether something PHYSICALLY sits in front of each
+# board half. p90 of a half is the board plane (holds as long as ≥10% of it
+# is visible); p10 more than this much nearer means an object covers ≥10% of
+# the half. Field values 2026-07-09: clear plane p10≈1915/p90≈1988; a person
+# in front read p10≈988 against p90≈1997.
+DEPTH_OBSTRUCTION_MM = 400
+
+
+def depth_blocked(stats: Optional[dict]) -> bool:
+    """Is a board half physically obstructed, per region_depth stats? Falls
+    to False (no evidence) on missing/degenerate data — the model's visual
+    flag still applies independently."""
+    if not stats or stats.get("valid_frac", 0) < 0.5 or "p10_mm" not in stats:
+        return False
+    return stats["p10_mm"] < stats["p90_mm"] - DEPTH_OBSTRUCTION_MM
 HISTORY_KEEP = 400  # scan/skip records kept in memory and in data/history.jsonl
 
 # Runtime-tunable settings (dashboard toggles, persisted in data/settings.json;
@@ -99,6 +115,7 @@ SETTING_BOUNDS = {
     "sightings_to_add": (int, 1, 10),    # reads a NEW item needs before its task is created
     "tick_confirm": bool,                # re-photograph + re-read before tick completions
     "low_light_boost": bool,             # dim frame -> re-capture with a 32-frame stack
+    "depth_guard": bool,                 # ToF depth says a board is physically blocked
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
     "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
     "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
@@ -420,6 +437,7 @@ class Syncer:
             "sightings_to_add": 2,
             "tick_confirm": True,
             "low_light_boost": True,
+            "depth_guard": True,
             "capture_frames": 8,
             "capture_quality": 92,
             "upscale": 1,
@@ -674,7 +692,8 @@ class Syncer:
         })
 
     def reconcile(self, seen: dict, apply: bool = True,
-                  tick_start_ok: bool = True, distrust: bool = False) -> dict:
+                  tick_start_ok: bool = True,
+                  force_protect: tuple = ()) -> dict:
         """Diff OCR results against known state. With ``apply`` (the default),
         push adds/completions to HA and persist; with ``apply=False`` (dry
         run) just report what WOULD happen, touching nothing.
@@ -728,11 +747,13 @@ class Syncer:
           and manually-removed items are purged (no HA call) once they've
           been erased for ``missing_to_complete`` scans."""
         guard = self.settings["obstruction_guard"]
-        # ``distrust`` (dim frame) protects BOTH boards regardless of the
-        # obstruction guard toggle: text sightings still keep items alive,
-        # but nothing may complete off a low-light read.
+        # ``force_protect`` boards are protected regardless of the
+        # obstruction guard toggle — used for dim frames (both boards) and
+        # for depth-detected physical obstructions: text sightings still
+        # keep items alive, but nothing may complete off those reads.
         protected = [b for b in ("work", "personal")
-                     if distrust or (guard and seen.get(f"{b}_obstructed"))]
+                     if b in force_protect
+                     or (guard and seen.get(f"{b}_obstructed"))]
         need_seen = self.settings["sightings_to_add"]
         base_miss = self.settings["missing_to_complete"]
         added, completed, pending, slowed, failed = [], [], [], [], 0
@@ -938,12 +959,37 @@ class Syncer:
             result["took_s"] = round(time.monotonic() - t0, 1)
             return self._done(result)
 
-    def _tick_completion_imminent(self, seen: dict) -> bool:
+    def _depth_obstructed(self) -> list[str]:
+        """Boards with something PHYSICALLY in front of them, per
+        kinect-knob's aligned-depth stats (self-illuminated ToF: works day
+        and pitch-black night, and unlike the model's visual judgment it
+        can't be fooled by lighting — the visual flag was observed flapping
+        at night on a clear board). Best-effort: [] when the endpoint is
+        unavailable (older kinect-knob) or the data is degenerate."""
+        x1, y1, x2, y2 = self.cfg.region
+        mid = (x1 + x2) // 2
+        blocked = []
+        for board, (rx1, rx2) in (("work", (x1, mid)), ("personal", (mid, x2))):
+            try:
+                r = requests.get(f"{self.cfg.kinect_url}/api/region_depth",
+                                 params={"x1": rx1, "y1": y1,
+                                         "x2": rx2, "y2": y2}, timeout=5)
+                r.raise_for_status()
+                stats = r.json()
+            except (requests.RequestException, ValueError) as exc:
+                log.debug("region_depth unavailable: %s", exc)
+                return []
+            if depth_blocked(stats):
+                blocked.append(board)
+        return blocked
+
+    def _tick_completion_imminent(self, seen: dict,
+                                  force_protect: tuple = ()) -> bool:
         """Would reconciling ``seen`` complete a task via its ticks?"""
         guard = self.settings["obstruction_guard"]
         need = self.settings["ticked_to_complete"]
         for board in ("work", "personal"):
-            if guard and seen.get(f"{board}_obstructed"):
+            if board in force_protect or (guard and seen.get(f"{board}_obstructed")):
                 continue  # protected: ticks are ignored there anyway
             done = [t.strip() for t in seen.get(f"{board}_done", []) if t.strip()]
             if not done:
@@ -997,8 +1043,15 @@ class Syncer:
         except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
             log.warning("board read failed: %s", exc)
             return {"ok": False, "error": f"read failed: {exc}", **base}
+        force_protect: tuple = ()
+        if dim:
+            force_protect = ("work", "personal")
+        elif self.settings["depth_guard"]:
+            force_protect = tuple(self._depth_obstructed())
+            if force_protect:
+                base["depth_blocked"] = list(force_protect)
         if (not dry and not dim and self.settings["tick_confirm"]
-                and self._tick_completion_imminent(seen)):
+                and self._tick_completion_imminent(seen, force_protect)):
             # About to complete a task off this read's ticks: re-photograph
             # and re-read, keeping only ticks BOTH reads agree on (see
             # confirm_ticks). A failed second read demotes every tick to an
@@ -1019,7 +1072,7 @@ class Syncer:
         result = self.reconcile(
             seen, apply=not dry,
             tick_start_ok=self.scans_since_change <= TICK_START_CHANGE_WINDOW,
-            distrust=dim)
+            force_protect=force_protect)
         if not dry and not result["failed"]:
             # A failed HA push means an item is not yet in Todoist; keeping
             # the old baseline forces a re-read (and a retry) next interval.
@@ -1312,6 +1365,8 @@ function outcome(r) {
   if (r.tick_confirmed === false)
     s += ' (confirm photo failed — tick completions deferred)';
   if (r.dim) s += ' (low light: 32-frame stack, completions deferred)';
+  if (Array.isArray(r.depth_blocked) && r.depth_blocked.length)
+    s += ' (depth: ' + r.depth_blocked.join(' + ') + ' physically blocked)';
   if (r.obstructed_ignored) s += ' (obstruction ignored)';               // legacy
   if (r.failed) s += ' (' + r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry)';
   return s;
@@ -1338,6 +1393,7 @@ const SETTINGS_UI = [
   ['sightings_to_add', 'num', 'Sightings to create task', { min: 1, max: 10, step: 1 }],
   ['tick_confirm', 'bool', 'Confirm ticks (2nd photo)'],
   ['low_light_boost', 'bool', 'Low light: stack 32 frames'],
+  ['depth_guard', 'bool', 'Depth guard (ToF obstruction)'],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
   ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
   ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],

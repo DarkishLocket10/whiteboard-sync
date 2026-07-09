@@ -75,9 +75,20 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   are scene-state-dependent, not image-enhancement-dependent (enhance
   on/off benchmarked identical). Don't chase single-run bench results;
   run multiple frames/runs and judge false positives strictly.
-- Low light (the Kinect exposes NO exposure control — freenect2 binding
-  has none, so true long exposures are impossible): frame stacking is the
-  synthetic long exposure. Measured 2026-07-09 ~02:50 (luma ~31 vs ~140
+- Depth guard: kinect-knob's `/api/region_depth` (self-illuminated ToF,
+  color-aligned, works in pitch black) reports per-board-half depth
+  percentiles; `depth_blocked()` calls a half obstructed when p10 sits
+  ≥400mm in front of p90 (the board plane, ~1950mm on this setup).
+  Depth-protected boards are force-protected INDEPENDENT of the
+  obstruction_guard toggle — this is the reliable obstruction signal (the
+  model's visual flag flaps at night). IR itself CANNOT read the boards:
+  512×424 over the full FOV leaves ~150px for both boards, and the
+  coloured inks are near-invisible at 860nm (verified with
+  `/api/snapshot?ir=1` 2026-07-09).
+- Low light (the color camera: kinect-knob gained a native exposure shim
+  2026-07-09 — kk_exposure.cpp — but it's capped per-frame and currently
+  pinned to a short shutter for gesture blur, so for whiteboard photos):
+  frame stacking is the synthetic long exposure. Measured 2026-07-09 ~02:50 (luma ~31 vs ~140
   lit): a single frame garbled text and read almost every box ticked; a
   32-frame stack transcribed near-perfectly but checkbox judgments stayed
   completion-grade unreliable. Hence: dim frames (luma < DIM_LUMA) auto

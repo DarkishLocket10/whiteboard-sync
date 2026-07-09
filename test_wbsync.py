@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from wbsync import (Config, Syncer, confirm_ticks, fuzzy_match,
-                    normalise_read, parse_region)
+from wbsync import (Config, Syncer, confirm_ticks, depth_blocked,
+                    fuzzy_match, normalise_read, parse_region)
 
 
 class FakeHA:
@@ -878,7 +878,8 @@ def test_dim_absence_counts_no_misses_even_with_guard_off(tmp_path):
     s.update_settings({"obstruction_guard": False, "missing_to_complete": 1})
     s.reconcile({"work": ["task"], "personal": []})
     s.ha.calls.clear()
-    result = s.reconcile({"work": [], "personal": []}, distrust=True)
+    result = s.reconcile({"work": [], "personal": []},
+                         force_protect=("work", "personal"))
     assert result["completed"] == [] and s.ha.calls == []
     assert s.state["items"][0]["missing"] == 0
 
@@ -899,6 +900,61 @@ def test_low_light_boost_can_be_disabled(tmp_path):
     result = s.scan(force=True)
     assert fetches == [None]                  # no re-capture
     assert result["dim"] is True              # but reads stay distrusted
+
+
+# -- depth guard ---------------------------------------------------------------
+
+def test_depth_blocked_rule():
+    # field values 2026-07-09: a person in front vs a clear board plane
+    assert depth_blocked({"p10_mm": 988, "p90_mm": 1997, "valid_frac": 0.97})
+    assert not depth_blocked({"p10_mm": 1915, "p90_mm": 1988, "valid_frac": 0.99})
+    assert not depth_blocked({"p10_mm": 500, "p90_mm": 2000, "valid_frac": 0.3})
+    assert not depth_blocked({"valid_frac": 0.9})    # degenerate: no percentiles
+    assert not depth_blocked(None)
+
+
+def test_depth_guard_protects_a_board_the_model_calls_clear(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"obstruction_guard": False, "tick_confirm": False})
+    s.reconcile({"work": ["task"], "personal": ["chore"]})
+    s.ha.calls.clear()
+    s._depth_obstructed = lambda: ["work"]
+    s.reader = SeqReader([{"work": [], "work_done": ["task"],
+                           "personal": [], "personal_done": ["chore"],
+                           "work_obstructed": False,
+                           "personal_obstructed": False}])
+    fake_fetch(s)
+    result = s.scan(force=True)
+    assert result["depth_blocked"] == ["work"]
+    # work tick ignored (physically blocked); personal tick completes
+    assert result["completed"] == ["chore"]
+    by_text = {i["text"]: i for i in s.state["items"]}
+    assert by_text["task"]["status"] == "open" and by_text["task"]["ticked"] == 0
+    assert by_text["chore"]["status"] == "done"
+
+
+def test_depth_guard_can_be_disabled(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"depth_guard": False, "tick_confirm": False})
+    calls = []
+    s._depth_obstructed = lambda: calls.append(1) or ["work"]
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reader = SeqReader([TICKED])
+    fake_fetch(s)
+    result = s.scan(force=True)
+    assert calls == []                       # depth endpoint never queried
+    assert result["completed"] == ["task"]
+
+
+def test_depth_endpoint_failure_degrades_to_no_evidence(tmp_path):
+    s = make_syncer(tmp_path)                # cfg.kinect_url is unreachable
+    s.update_settings({"tick_confirm": False})
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reader = SeqReader([TICKED])
+    fake_fetch(s)
+    result = s.scan(force=True)              # real _depth_obstructed -> []
+    assert "depth_blocked" not in result
+    assert result["completed"] == ["task"]   # model-only path still works
 
 
 # -- mass-erase guard --------------------------------------------------------
