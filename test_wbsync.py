@@ -773,6 +773,67 @@ def test_scan_keeps_reading_unchanged_frames_while_pending_exists(tmp_path):
     assert result["changed"] is False                # skip resumes
 
 
+# -- static-scene tick gate ---------------------------------------------------
+
+def test_tick_streak_cannot_start_on_a_long_static_scene(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    r = s.reconcile({"work": [], "work_done": ["task"], "personal": []},
+                    tick_start_ok=False)
+    assert r["completed"] == [] and s.ha.calls == []
+    item = s.state["items"][0]
+    assert item["status"] == "open" and item["ticked"] == 0
+    assert item["missing"] == 0                      # text sighting still counts
+    # same tick near a real frame change: completes normally
+    r = s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    assert r["completed"] == ["task"]
+
+
+def test_started_streak_may_finish_on_static_frames(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"ticked_to_complete": 2})
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    s.reconcile({"work": [], "work_done": ["task"], "personal": []})  # change frame
+    assert s.state["items"][0]["ticked"] == 1
+    # the mark persisting on later static frames is confirmation, not a start
+    r = s.reconcile({"work": [], "work_done": ["task"], "personal": []},
+                    tick_start_ok=False)
+    assert r["completed"] == ["task"]
+
+
+def test_pending_static_tick_does_not_become_a_done_ghost(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.reconcile({"work": ["new item"], "personal": []})
+    r = s.reconcile({"work": [], "work_done": ["new item"], "personal": []},
+                    tick_start_ok=False)
+    item = s.state["items"][0]
+    assert item["status"] == "open"                  # counted as a sighting:
+    assert s.ha.calls[-1][:2] == ("todoist", "new_task")  # task got created
+
+
+def test_scan_loop_tracks_scene_staleness(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"change_detection": False, "tick_confirm": False})
+    s.reconcile({"work": ["task"], "personal": []})
+    s.ha.calls.clear()
+    s.reader = SeqReader([OPEN, OPEN, OPEN, OPEN, TICKED, TICKED])
+    fake_fetch(s)
+    for _ in range(4):                               # frames identical throughout
+        s.scan(force=True)
+    assert s.scans_since_change == 3                 # first scan had no baseline
+    result = s.scan(force=True)                      # tick appears on static scene
+    assert result["completed"] == []                 # blocked: cannot start
+    assert s.state["items"][0]["ticked"] == 0
+    # now the frame actually changes: the tick may start and complete
+    import numpy as np
+    s._fetch_crop = lambda: (b"jpeg", np.full((5, 5), 50, dtype=np.float32))
+    result = s.scan(force=True)
+    assert s.scans_since_change == 0
+    assert result["completed"] == ["task"]
+
+
 # -- mass-erase guard --------------------------------------------------------
 
 def test_garbage_read_defers_mass_completions_one_extra_scan(tmp_path):

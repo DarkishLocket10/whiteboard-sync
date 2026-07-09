@@ -59,6 +59,17 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   reads minutes apart while the board read unobstructed; streaks alone
   can't stop correlated repeats). Disputed or unconfirmable ticks demote
   to plain sightings — deferring a completion is always safe.
+- On top of all that, a tick streak may only START within
+  `TICK_START_CHANGE_WINDOW` scans of a real frame change (diff ≥
+  threshold): a new mark necessarily changes pixels, so a tick first
+  sighted on a long-static scene is a misread. This is what finally
+  stopped the static-scene failure (2026-07-09 00:39: with
+  change_detection toggled off, three near-identical static frames agreed
+  on the same false tick — streak AND confirm photo were defeated by
+  correlation, 3 tasks falsely completed). The gate holds regardless of
+  the change_detection / obstruction_guard dashboard toggles. Streaks
+  already under way still finish on static frames (the mark persisting IS
+  the confirmation), and it also blocks static-tick pending→done ghosts.
 - Model reads are NOT deterministic even at temperature 0 on an identical
   image (marginal checkboxes flip between runs), and false-positive bursts
   are scene-state-dependent, not image-enhancement-dependent (enhance

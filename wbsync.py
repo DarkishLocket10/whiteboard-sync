@@ -63,6 +63,12 @@ EDIT_LOCK_TIMEOUT_S = 5.0  # how long a dashboard edit waits out a running scan
 # When ONE read would complete this many items by ABSENCE while still seeing
 # other items on the board, suspect a garbage read and demand an extra miss.
 MASS_ERASE_MIN = 4
+# A tick STREAK may only start within this many scans of a real frame change
+# (diff >= threshold). A new mark necessarily changes pixels; a tick that
+# "appears" while the scene has been static for longer is a misread. The
+# window > 0 covers detection lag (a tick missed on its change frame and
+# first read a scan or two later).
+TICK_START_CHANGE_WINDOW = 2
 HISTORY_KEEP = 400  # scan/skip records kept in memory and in data/history.jsonl
 
 # Runtime-tunable settings (dashboard toggles, persisted in data/settings.json;
@@ -376,6 +382,7 @@ class Syncer:
         self.items_view: list[dict] = [dict(i) for i in self.state["items"]]
         self.last_result: dict = {}
         self.last_scan_t: float = 0.0
+        self.scans_since_change = 0  # see TICK_START_CHANGE_WINDOW
         self.scanning = False
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.loop_beat = time.time()
@@ -651,10 +658,18 @@ class Syncer:
             "status": "completed",
         })
 
-    def reconcile(self, seen: dict, apply: bool = True) -> dict:
+    def reconcile(self, seen: dict, apply: bool = True,
+                  tick_start_ok: bool = True) -> dict:
         """Diff OCR results against known state. With ``apply`` (the default),
         push adds/completions to HA and persist; with ``apply=False`` (dry
         run) just report what WOULD happen, touching nothing.
+        ``tick_start_ok=False`` (the scene has been static for more than
+        ``TICK_START_CHANGE_WINDOW`` scans) blocks NEW tick streaks from
+        starting: a real new tick necessarily changed pixels recently, so a
+        tick first sighted on a long-static scene is a misread — observed
+        live 2026-07-09 00:39, when three near-identical static frames
+        agreed on the same false tick and defeated both the streak and the
+        confirm photo. Streaks already under way still accrue and complete.
         Returns {'added': [...], 'completed': [...]} of item texts plus
         'pending' (new texts still waiting for confirming sightings), a
         'failed' count of HA calls that didn't land (they retry next scan),
@@ -794,13 +809,16 @@ class Syncer:
                     # CONSECUTIVE: one miss on a clear board kills the item
                     # — that strictness is the whole anti-hallucination
                     # point, and a real item just starts accruing again.
+                    # A static-scene tick is a misread here too — it would
+                    # park the item as done and its task would never exist.
+                    pending_tick = ticked and tick_start_ok
                     if not apply:
-                        if not ticked and sighted and item["seen"] + 1 >= need_seen:
+                        if not pending_tick and sighted and item["seen"] + 1 >= need_seen:
                             added.append(item["text"])
                         elif sighted:
                             pending.append(item["text"])
                         continue
-                    if ticked:
+                    if pending_tick:
                         # Finished before we ever believed in it — never a task.
                         item.pop("seen", None)
                         item["status"] = "done"
@@ -835,6 +853,12 @@ class Syncer:
                     continue
 
                 if ticked:  # trusted tick: clear board only
+                    if item["ticked"] == 0 and not tick_start_ok:
+                        # long-static scene: a "new" tick is a misread (see
+                        # docstring) — count the text sighting, nothing else
+                        if apply:
+                            item["missing"] = 0
+                        continue
                     if not apply:
                         if item["ticked"] + 1 >= self.settings["ticked_to_complete"]:
                             completed.append(item["text"])
@@ -921,6 +945,10 @@ class Syncer:
         s = self.settings
         diff = self._diff_score(gray)
         base = {"diff": None if diff is None else round(diff, 2)}
+        if diff is None or diff >= s["change_threshold"]:
+            self.scans_since_change = 0
+        else:
+            self.scans_since_change += 1
         # Pending items confirm through consecutive PROCESSED reads, but the
         # board doesn't change while they wait — skipping unchanged frames
         # would strand them forever. Keep reading until none are pending.
@@ -950,7 +978,9 @@ class Syncer:
         blocked = [b for b in ("work", "personal") if seen.get(f"{b}_obstructed")]
         if blocked:
             base["obstructed"] = blocked
-        result = self.reconcile(seen, apply=not dry)
+        result = self.reconcile(
+            seen, apply=not dry,
+            tick_start_ok=self.scans_since_change <= TICK_START_CHANGE_WINDOW)
         if not dry and not result["failed"]:
             # A failed HA push means an item is not yet in Todoist; keeping
             # the old baseline forces a re-read (and a retry) next interval.
