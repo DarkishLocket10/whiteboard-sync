@@ -537,6 +537,7 @@ def test_manual_edits_refuse_rather_than_block_during_a_scan(tmp_path, monkeypat
     try:
         assert s.edit_item("work", "task", "renamed")[0] == 409
         assert s.remove_item("work", "task")[0] == 409
+        assert s.reopen_item("work", "task")[0] == 409
     finally:
         s._lock.release()
 
@@ -548,6 +549,73 @@ def test_manual_edits_land_in_history(tmp_path):
     assert s.history[-1]["type"] == "manual" and s.history[-1]["action"] == "edit"
     s.remove_item("work", "task v2")
     assert s.history[-1]["action"] == "remove" and s.history[-1]["text"] == "task v2"
+
+
+def test_reopen_done_item_creates_fresh_task_and_reopens(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["task"], "personal": []})  # completed
+    assert s.state["items"][0]["status"] == "done"
+    s.ha.calls.clear()
+    code, body = s.reopen_item("work", "task")
+    assert code == 200 and body["ok"]
+    assert s.ha.calls == [("todoist", "new_task", {
+        "content": "task", "project": "Inbox",
+        "labels": ["whiteboard", "work"], "due_date_string": "today",
+    })]
+    item = s.state["items"][0]
+    assert item["status"] == "open" and item["ticked"] == 0 and item["missing"] == 0
+    assert make_syncer(tmp_path).state["items"][0]["status"] == "open"  # persisted
+    assert s.history[-1] == {"type": "manual", "action": "reopen",
+                             "board": "work", "text": "task",
+                             "at": s.history[-1]["at"], "t": s.history[-1]["t"]}
+    # still ticked on the physical board: the scans will complete it again
+    result = s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    assert result["completed"] == ["task"]
+
+
+def test_reopen_removed_item_restores_it(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.remove_item("work", "task")
+    s.ha.calls.clear()
+    code, _ = s.reopen_item("work", "task")
+    assert code == 200
+    assert s.ha.calls[-1][:2] == ("todoist", "new_task")
+    assert s.state["items"][0]["status"] == "open"
+
+
+def test_reopen_ghost_done_item_creates_its_first_task(tmp_path):
+    s = make_syncer(tmp_path)
+    # first seen already ticked: tracked as done, never had a Todoist task
+    s.reconcile({"work": [], "work_done": ["misread tick"], "personal": []})
+    s.ha.calls.clear()
+    code, _ = s.reopen_item("work", "misread tick")
+    assert code == 200
+    assert s.ha.calls[-1][:2] == ("todoist", "new_task")
+
+
+def test_reopen_edge_cases(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["open item"], "personal": []})   # open, task exists
+    s.settings["sightings_to_add"] = 2
+    s.reconcile({"work": ["open item", "confirmed"], "personal": []})  # pending
+    assert s.state["items"][-1]["status"] == "pending"
+    s.ha.calls.clear()
+    assert s.reopen_item("work", "no such")[0] == 404
+    assert s.reopen_item("work", "confirmed")[0] == 400    # pending: no task yet
+    code, _ = s.reopen_item("work", "open item")           # already open: no-op
+    assert code == 200 and s.ha.calls == []
+
+
+def test_reopen_failed_ha_push_changes_nothing(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["task"], "personal": []})
+    s.ha.ok = False
+    code, _ = s.reopen_item("work", "task")
+    assert code == 502
+    assert s.state["items"][0]["status"] == "done"
 
 
 # -- model output normalisation ---------------------------------------------

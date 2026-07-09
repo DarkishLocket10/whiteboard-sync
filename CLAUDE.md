@@ -65,12 +65,16 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   on/off benchmarked identical). Don't chase single-run bench results;
   run multiple frames/runs and judge false positives strictly. Change detection is bypassed while any item is
   pending, so sightings can accrue on an unchanged board.
-- Item edits belong on the dashboard, not in the JSON: the ✎/× buttons hit
-  `POST /api/items/edit` (renames the Todoist task too, keeping state
-  canonical) and `POST /api/items/remove` (deletes the Todoist task via
-  `todo.remove_item`). Both take `{board, text}` (+`new_text` for edit),
-  refuse with 409 while a scan holds the lock, and fail without touching
-  state if the HA call fails.
+- Item edits belong on the dashboard, not in the JSON: the ✎/↩/× buttons
+  hit `POST /api/items/edit` (renames the Todoist task too, keeping state
+  canonical), `POST /api/items/reopen` (mark as NOT done: creates a fresh
+  Todoist task — a completed task can't be un-completed through HA's todo
+  entity and a removed one's task was deleted — and flips the item back
+  to open; if the board's checkbox is still marked the scans will just
+  complete it again, the dialog warns), and `POST /api/items/remove`
+  (deletes the Todoist task via `todo.remove_item`). All take
+  `{board, text}` (+`new_text` for edit), refuse with 409 while a scan
+  holds the lock, and fail without touching state if the HA call fails.
 - The change-detection baseline (`data/baseline.npy`) only updates after a
   *processed* read whose HA pushes ALL succeeded, so a failed model call or
   a failed Todoist push retries on the next interval.

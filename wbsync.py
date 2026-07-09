@@ -533,6 +533,42 @@ class Syncer:
         finally:
             self._lock.release()
 
+    def reopen_item(self, board: str, text: str) -> tuple[int, dict]:
+        """Mark a done/removed item as NOT done from the dashboard, by
+        creating a FRESH Todoist task with the canonical text and flipping
+        the item back to "open". A completed task can't be un-completed
+        through HA's todo entity (Todoist only lists active tasks there)
+        and a removed item's task was deleted — a new task is the reliable
+        path either way; it also does the right thing for tick-misread
+        "done" ghosts that never had a task at all. NB: if the checkbox is
+        still marked on the physical board, the next clear scans will
+        simply complete the item again — the mark must be wiped too (the
+        dashboard's confirm dialog says so)."""
+        if not self._lock.acquire(timeout=EDIT_LOCK_TIMEOUT_S):
+            return 409, {"error": "a scan is running — try again in a moment"}
+        try:
+            item = self._find_item(board, text)
+            if item is None:
+                return 404, {"error": "item not found — state changed, refreshing"}
+            if item["status"] == "open":
+                return 200, {"ok": True, "item": dict(item)}  # nothing to do
+            if item["status"] == "pending":
+                return 400, {"error": "item is still unconfirmed — it has no "
+                                      "Todoist task to reopen"}
+            if not self._push_task(text, board):
+                return 502, {"error": "Todoist task creation via HA failed — "
+                                      "item unchanged"}
+            item["status"] = "open"
+            item["missing"] = 0
+            item["ticked"] = 0
+            self._save_items()
+            self._record({"type": "manual", "action": "reopen", "board": board,
+                          "text": text})
+            log.info("manual reopen [%s] %r", board, text)
+            return 200, {"ok": True, "item": dict(item)}
+        finally:
+            self._lock.release()
+
     # -- imaging --------------------------------------------------------
     def _fetch_crop(self) -> tuple[bytes, np.ndarray]:
         s = self.settings
@@ -588,6 +624,18 @@ class Syncer:
         return float(np.abs(gray - baseline).mean())
 
     # -- reconciliation ---------------------------------------------------
+    def _push_task(self, text: str, board: str) -> bool:
+        task = {
+            "content": text,
+            "project": self.cfg.todoist_project,
+            "labels": ["whiteboard", board],
+        }
+        if self.settings["due_today"]:
+            # Todoist parses this in the ACCOUNT's timezone — safer
+            # than a date computed on this container's (UTC) clock.
+            task["due_date_string"] = "today"
+        return self.ha.call("todoist", "new_task", task)
+
     def _complete_in_todoist(self, item: dict) -> bool:
         return self.ha.call("todo", "update_item", {
             "entity_id": self.cfg.todo_entity,
@@ -653,18 +701,6 @@ class Syncer:
             known = [i for i in self.state["items"] if i["board"] == board]
             known_texts = [i["text"] for i in known]
 
-            def push_task(text: str, board: str = board) -> bool:
-                task = {
-                    "content": text,
-                    "project": self.cfg.todoist_project,
-                    "labels": ["whiteboard", board],
-                }
-                if self.settings["due_today"]:
-                    # Todoist parses this in the ACCOUNT's timezone — safer
-                    # than a date computed on this container's (UTC) clock.
-                    task["due_date_string"] = "today"
-                return self.ha.call("todoist", "new_task", task)
-
             open_matched, done_matched = set(), set()
             for text in seen_open:
                 match = fuzzy_match(text, known_texts)
@@ -682,7 +718,7 @@ class Syncer:
                 if not apply:
                     added.append(text)
                     continue
-                if push_task(text):
+                if self._push_task(text, board):
                     self.state["items"].append({"text": text, "board": board,
                                                 "status": "open", "missing": 0,
                                                 "ticked": 0})
@@ -746,7 +782,7 @@ class Syncer:
                     elif sighted:
                         item["seen"] += 1
                         if item["seen"] >= need_seen:
-                            if push_task(item["text"]):
+                            if self._push_task(item["text"], board):
                                 item.pop("seen", None)
                                 item["status"] = "open"
                                 added.append(item["text"])
@@ -1161,7 +1197,8 @@ function outcome(r) {
     .map(([k, v]) => k + '=' + v).join(', ');
   if (r.type === 'manual') return r.action === 'edit'
     ? 'edited (' + r.board + '): “' + r.from + '” → “' + r.to + '”'
-    : 'removed (' + r.board + '): “' + r.text + '”';
+    : (r.action === 'reopen' ? 'reopened' : 'removed') +
+      ' (' + r.board + '): “' + r.text + '”';
   if (r.type === 'skip') return r.reason === 'home'
     ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
@@ -1326,6 +1363,12 @@ function render() {
       const be = el('button', 'ib', '\\u270e'); be.title = 'Edit task text';
       be.addEventListener('click', () => editItem(it));
       end.appendChild(be);
+      if (it.status === 'done' || it.status === 'removed') {
+        const br = el('button', 'ib', '\\u21a9');
+        br.title = 'Mark as not done — creates a fresh Todoist task';
+        br.addEventListener('click', () => reopenItem(it));
+        end.appendChild(br);
+      }
       if (it.status !== 'removed') {
         const bx = el('button', 'ib', '\\u00d7');
         bx.title = it.status === 'open'
@@ -1483,6 +1526,16 @@ function editItem(it) {
   itemCall('/api/items/edit', { board: it.board, text: it.text, new_text: nt },
     'Renamed to \\u201c' + nt.trim() + '\\u201d');
 }
+function reopenItem(it) {
+  const msg = 'Mark \\u201c' + it.text + '\\u201d as not done?\\n\\nCreates a fresh ' +
+    'Todoist task (the old one stays completed/deleted \\u2014 Todoist can\\u2019t ' +
+    'un-complete through Home Assistant). If the checkbox on the BOARD is still ' +
+    'marked, wipe the mark off too \\u2014 otherwise the next scans will just ' +
+    'complete it again.';
+  if (!confirm(msg)) return;
+  itemCall('/api/items/reopen', { board: it.board, text: it.text },
+    'Reopened \\u201c' + it.text + '\\u201d');
+}
 function removeItem(it) {
   const msg = it.status === 'open'
     ? 'Remove \\u201c' + it.text + '\\u201d?\\n\\nDeletes the Todoist task. While the ' +
@@ -1579,7 +1632,8 @@ def serve_http(syncer: Syncer) -> None:
                     self._json(400, {"error": f"bad body: {exc}"})
                     return
                 self._json(200, syncer.update_settings(patch))
-            elif url.path in ("/api/items/edit", "/api/items/remove"):
+            elif url.path in ("/api/items/edit", "/api/items/remove",
+                              "/api/items/reopen"):
                 length = int(self.headers.get("Content-Length") or 0)
                 try:
                     body = json.loads(self.rfile.read(length) or b"{}")
@@ -1595,8 +1649,10 @@ def serve_http(syncer: Syncer) -> None:
                     return
                 if url.path.endswith("/edit"):
                     code, resp = syncer.edit_item(board, text, body["new_text"])
-                else:
+                elif url.path.endswith("/remove"):
                     code, resp = syncer.remove_item(board, text)
+                else:
+                    code, resp = syncer.reopen_item(board, text)
                 self._json(code, resp)
             else:
                 self._json(404, {"error": "not found"})
