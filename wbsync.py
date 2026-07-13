@@ -22,9 +22,12 @@ into Todoist via Home Assistant:
 
 Scans run every ``WB_INTERVAL_S`` seconds, only while ``WB_PRESENCE_ENTITY``
 is away (that's also when nobody blocks the camera's view of the boards),
-and the Claude call is skipped entirely when the cropped board region hasn't
-changed since the last processed scan — so vision costs accrue only when
-something was actually written or erased.
+and the vision read is skipped entirely when ToF depth says someone is
+physically at a board (their body hides parts of lines and the fragments
+become tasks), when the frame is too dim to trust (dim reads add partial
+garbage), or when the cropped board region hasn't changed since the last
+processed scan — so vision costs accrue only when something was actually
+written or erased.
 
 A dashboard on port 8430 (``GET /``) shows what the service is doing:
 presence gate, tracked items, scan history with change scores, and the
@@ -78,8 +81,11 @@ TICK_START_CHANGE_WINDOW = 2
 # stacked, dark-frame CHECKBOX judgments stay completion-grade unreliable,
 # and a pitch-black frame reads as an EMPTY board — which absence logic
 # would treat as a real wipe.
-DIM_LUMA = 55        # below: stack LOWLIGHT_FRAMES + defer all completions
-DARK_LUMA = 18       # below: unreadable — skip the scan entirely
+DIM_LUMA = 55        # default dim_luma setting. Below it: skip the scan when
+                     # dim_skip is on (dim reads still ADD partial garbage —
+                     # protection only deferred completions); with dim_skip
+                     # off, stack LOWLIGHT_FRAMES + defer all completions
+DARK_LUMA = 18       # below: unreadable — always skip, even when forced
 LOWLIGHT_FRAMES = 32
 # Depth guard: kinect-knob's /api/region_depth (self-illuminated ToF, aligned
 # to the color frame) says whether something PHYSICALLY sits in front of each
@@ -116,6 +122,9 @@ SETTING_BOUNDS = {
     "tick_confirm": bool,                # re-photograph + re-read before tick completions
     "low_light_boost": bool,             # dim frame -> re-capture with a 32-frame stack
     "depth_guard": bool,                 # ToF depth says a board is physically blocked
+    "depth_skip": bool,                  # someone at a board (ToF) -> skip the scan entirely
+    "dim_skip": bool,                    # dim frame -> skip instead of reading protected
+    "dim_luma": (int, 10, 150),          # mean luma below which a frame counts as dim
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
     "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
     "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
@@ -419,7 +428,7 @@ class Syncer:
         self.gate: dict = {}  # last presence-gate skip, for the dashboard
         self.counters = {"scans": 0, "changed": 0, "unchanged": 0, "obstructed": 0,
                          "errors": 0, "added": 0, "completed": 0, "skips_home": 0,
-                         "skips_off": 0}
+                         "skips_off": 0, "skips_person": 0, "skips_dim": 0}
         self._presence: Optional[str] = None
         self._presence_t = 0.0
         self._settings_path = cfg.data_dir / "settings.json"
@@ -438,6 +447,9 @@ class Syncer:
             "tick_confirm": True,
             "low_light_boost": True,
             "depth_guard": True,
+            "depth_skip": True,
+            "dim_skip": True,
+            "dim_luma": DIM_LUMA,
             "capture_frames": 8,
             "capture_quality": 92,
             "upscale": 1,
@@ -1002,14 +1014,38 @@ class Syncer:
         return False
 
     def _scan_inner(self, force: bool, dry: bool) -> dict:
+        s = self.settings
+        if not force and s["depth_skip"]:
+            # Someone physically at a board (per ToF depth, before any photo
+            # is taken): their body hides parts of lines and the model turns
+            # the visible fragments into pending sightings that become real
+            # Todoist tasks. Reading through an obstruction has no upside on
+            # this cadence — skip and catch up when they step away. Force
+            # (the dashboard's Scan-now button) still scans, with the blocked
+            # boards protected by the reconcile-time depth guard as before.
+            present = self._depth_obstructed()
+            if present:
+                return {"ok": True, "changed": False, "person": present}
         try:
             jpeg, gray = self._fetch_crop()
         except requests.RequestException as exc:
             return {"ok": False, "error": f"snapshot failed: {exc}"}
-        s = self.settings
         luma = float(gray.mean())
-        if (luma < DIM_LUMA and s["low_light_boost"]
-                and s["capture_frames"] < LOWLIGHT_FRAMES):
+        base = {"luma": round(luma)}
+        if luma < DARK_LUMA:
+            # Unreadable. NEVER reconcile a black frame: it reads as an
+            # empty board, which absence logic would complete as a wipe.
+            return {"ok": True, "changed": False, "dark": True, **base}
+        dim = luma < s["dim_luma"]
+        if dim and not force and s["dim_skip"]:
+            # Dim reads are false-positive factories: even the 32-frame
+            # stack leaves garbled fragments that accrue sightings and land
+            # in Todoist as partial text (protection only deferred
+            # COMPLETIONS — adds still went through). Nobody writes on the
+            # boards in the dark; skip and let the first lit scan catch up.
+            # A forced scan still reads via the boosted, protected path.
+            return {"ok": True, "changed": False, "dim_skipped": True, **base}
+        if dim and s["low_light_boost"] and s["capture_frames"] < LOWLIGHT_FRAMES:
             # Synthetic long exposure: the Kinect has no exposure control,
             # but averaging 32 frames buys the same noise reduction. At
             # night this is the difference between garbled text with almost
@@ -1017,14 +1053,12 @@ class Syncer:
             try:
                 jpeg, gray = self._fetch_crop(frames=LOWLIGHT_FRAMES)
                 luma = float(gray.mean())
+                dim = luma < s["dim_luma"]
+                base["luma"] = round(luma)
+                if luma < DARK_LUMA:  # lights went out mid-stack
+                    return {"ok": True, "changed": False, "dark": True, **base}
             except requests.RequestException as exc:
                 log.warning("low-light re-capture failed, using first: %s", exc)
-        base = {"luma": round(luma)}
-        if luma < DARK_LUMA:
-            # Unreadable. NEVER reconcile a black frame: it reads as an
-            # empty board, which absence logic would complete as a wipe.
-            return {"ok": True, "changed": False, "dark": True, **base}
-        dim = luma < DIM_LUMA
         diff = self._diff_score(gray)
         base["diff"] = None if diff is None else round(diff, 2)
         if diff is None or diff >= s["change_threshold"]:
@@ -1087,6 +1121,10 @@ class Syncer:
         c["scans"] += 1
         if not result.get("ok"):
             c["errors"] += 1
+        elif result.get("person"):
+            c["skips_person"] += 1
+        elif result.get("dim_skipped"):
+            c["skips_dim"] += 1
         elif not result.get("changed"):
             c["unchanged"] += 1
         else:
@@ -1351,6 +1389,9 @@ function outcome(r) {
     ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
   if (r.dark) return 'too dark to read (luma ' + r.luma + ') — skipped';
+  if (r.person) return 'skipped — someone at the ' + r.person.join(' + ') +
+    ' board' + (r.person.length > 1 ? 's' : '') + ' (depth)';
+  if (r.dim_skipped) return 'too dim to trust (luma ' + r.luma + ') — skipped';
   if (r.obstructed === true) return 'board obstructed — left alone';  // legacy records
   if (r.changed === false) return 'no change';
   const a = (r.added || []).length, c = (r.completed || []).length;
@@ -1394,6 +1435,9 @@ const SETTINGS_UI = [
   ['tick_confirm', 'bool', 'Confirm ticks (2nd photo)'],
   ['low_light_boost', 'bool', 'Low light: stack 32 frames'],
   ['depth_guard', 'bool', 'Depth guard (ToF obstruction)'],
+  ['depth_skip', 'bool', 'Skip scan when someone is at a board'],
+  ['dim_skip', 'bool', 'Skip scan when light is dim'],
+  ['dim_luma', 'num', 'Dim threshold (luma 0-255)', { min: 10, max: 150, step: 5 }],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
   ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
   ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],
@@ -1547,7 +1591,8 @@ function render() {
   const c = st.counters, cfg = st.config, set = st.settings;
   $('counters').textContent = 'since start: ' + c.scans + ' scans · ' + c.changed +
     ' processed · ' + c.unchanged + ' unchanged · ' + c.obstructed + ' obstructed · ' +
-    c.errors + ' errors · ' + c.skips_home + ' home-skips · ' + c.skips_off + ' off-skips';
+    c.errors + ' errors · ' + c.skips_home + ' home-skips · ' + c.skips_off + ' off-skips · ' +
+    (c.skips_person || 0) + ' person-skips · ' + (c.skips_dim || 0) + ' dim-skips';
   $('meta').textContent = 'model ' + cfg.model + ' · crop region ' + cfg.region.join(',') +
     ' · photo: ' + set.capture_frames + ' frames stacked, ' + set.capture_format +
     (set.capture_format === 'jpeg' ? ' q' + set.capture_quality : '') +

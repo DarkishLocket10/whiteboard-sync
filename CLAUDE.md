@@ -85,17 +85,36 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   512×424 over the full FOV leaves ~150px for both boards, and the
   coloured inks are near-invisible at 860nm (verified with
   `/api/snapshot?ir=1` 2026-07-09).
+- Depth presence SKIP (2026-07-13, `depth_skip` toggle, default on): a
+  scheduled scan first asks `_depth_obstructed()` BEFORE taking a photo;
+  if someone is physically at either board the scan is skipped outright
+  (history: "someone at the … board"). Rationale: reading through a
+  person only ever contributed partial-line fragments that accrued
+  sightings and became real Todoist tasks — Yash sits at the work board
+  all day, so those scans were pure downside. Consequence: while he's at
+  the desk NOTHING scans (personal board included) until he steps away;
+  that matches the original "scan while away" design. Forced scans
+  (`/scan?force=1`, the dashboard button) bypass the skip and fall back
+  to the old read-through-with-depth-guard behavior, as does turning
+  `depth_skip` off. Depth endpoint unreachable → no evidence → scan
+  proceeds (old guards still apply).
 - Low light (the color camera: kinect-knob gained a native exposure shim
   2026-07-09 — kk_exposure.cpp — but it's capped per-frame and currently
   pinned to a short shutter for gesture blur, so for whiteboard photos):
   frame stacking is the synthetic long exposure. Measured 2026-07-09 ~02:50 (luma ~31 vs ~140
   lit): a single frame garbled text and read almost every box ticked; a
   32-frame stack transcribed near-perfectly but checkbox judgments stayed
-  completion-grade unreliable. Hence: dim frames (luma < DIM_LUMA) auto
-  re-capture with 32 frames and reconcile with BOTH boards protected
-  (regardless of the obstruction_guard toggle); pitch-dark frames
-  (< DARK_LUMA) skip entirely — a black frame reads as an EMPTY board,
-  which absence logic would complete as a full wipe.
+  completion-grade unreliable. Even so, "near-perfect" still leaked:
+  protection only deferred COMPLETIONS, so garbled fragments from dim
+  stacks accrued sightings and landed in Todoist as partial text. Hence
+  (2026-07-13): scheduled scans SKIP dim frames outright (`dim_skip`
+  toggle, default on; threshold is the `dim_luma` setting, default 55,
+  tunable on the dashboard — history: "too dim to trust"). Forced scans,
+  or `dim_skip` off, use the old path: re-capture with 32 frames and
+  reconcile with BOTH boards protected (regardless of the
+  obstruction_guard toggle). Pitch-dark frames (< DARK_LUMA) always skip,
+  forced or not — a black frame reads as an EMPTY board, which absence
+  logic would complete as a full wipe.
 - Marker-COLOUR detection was benchmarked 2026-07-09 and NOT shipped: a
   per-item colour enum after the checkbox field is checkbox-safe (77/84,
   0 FP unchanged), but the Kinect renders ink nearly desaturated — black

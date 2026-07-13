@@ -902,6 +902,60 @@ def test_low_light_boost_can_be_disabled(tmp_path):
     assert result["dim"] is True              # but reads stay distrusted
 
 
+def test_dim_frames_skip_entirely_on_scheduled_scans(tmp_path):
+    """Dim reads are false-positive factories: protection only deferred
+    COMPLETIONS, so garbled fragments still accrued sightings and landed in
+    Todoist as partial text. A scheduled dim scan must not read at all."""
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reader = SeqReader([])                  # any read attempt would blow up
+    fetches = []
+    import numpy as np
+
+    def fetch(frames=None):
+        fetches.append(frames)
+        return b"jpeg", np.full((5, 5), 30, dtype=np.float32)
+
+    s._fetch_crop = fetch
+    result = s.scan()
+    assert result["ok"] is True and result["dim_skipped"] is True
+    assert result["luma"] == 30
+    assert fetches == [None]                  # no 32-frame re-capture either
+    assert s.reader.calls == 0
+    assert s.state["items"][0]["missing"] == 0
+    assert s.counters["skips_dim"] == 1
+
+
+def test_dim_skip_disabled_reads_via_boosted_protected_path(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"dim_skip": False})
+    s.reconcile({"work": ["task"], "personal": []})
+    fetches = []
+    import numpy as np
+
+    def fetch(frames=None):
+        fetches.append(frames)
+        return b"jpeg", np.full((5, 5), 30, dtype=np.float32)
+
+    s._fetch_crop = fetch
+    s.reader = SeqReader([TICKED])
+    result = s.scan()
+    assert fetches == [None, 32]              # old behavior: boost + protect
+    assert result["dim"] is True and result["completed"] == []
+
+
+def test_dim_threshold_is_tunable(tmp_path):
+    """Lowering dim_luma lets marginal-light frames through as normal reads."""
+    s = make_syncer(tmp_path)
+    s.update_settings({"dim_luma": 25})
+    s.reconcile({"work": ["task"], "personal": []})
+    s.reader = SeqReader([OPEN])
+    fake_fetch(s, luma=30.0)
+    result = s.scan()
+    assert "dim_skipped" not in result and "dim" not in result
+    assert result["changed"] is True and s.reader.calls == 1
+
+
 # -- depth guard ---------------------------------------------------------------
 
 def test_depth_blocked_rule():
@@ -955,6 +1009,56 @@ def test_depth_endpoint_failure_degrades_to_no_evidence(tmp_path):
     result = s.scan(force=True)              # real _depth_obstructed -> []
     assert "depth_blocked" not in result
     assert result["completed"] == ["task"]   # model-only path still works
+
+
+# -- depth presence skip (someone sitting at a board) --------------------------
+
+def test_person_at_board_skips_scan_entirely(tmp_path):
+    """ToF depth says someone is at a board BEFORE any photo is taken: no
+    capture, no model read. Their body hides parts of lines and the visible
+    fragments would accrue sightings and become real Todoist tasks."""
+    s = make_syncer(tmp_path)
+    s._depth_obstructed = lambda: ["work"]
+    s.reader = SeqReader([])                  # any read attempt would blow up
+    fetches = []
+    s._fetch_crop = lambda frames=None: fetches.append(frames)
+    result = s.scan()
+    assert result["ok"] is True and result["changed"] is False
+    assert result["person"] == ["work"]
+    assert fetches == [] and s.reader.calls == 0
+    assert s.counters["skips_person"] == 1
+    assert s.history[-1]["person"] == ["work"]
+
+
+def test_person_skip_can_be_disabled(tmp_path):
+    """With depth_skip off the old behavior holds: read through the person,
+    reconcile-time depth guard protecting the blocked board."""
+    s = make_syncer(tmp_path)
+    s.update_settings({"depth_skip": False, "tick_confirm": False})
+    s.reconcile({"work": ["task"], "personal": []})
+    s._depth_obstructed = lambda: ["work"]
+    s.reader = SeqReader([TICKED])
+    fake_fetch(s)
+    result = s.scan()
+    assert "person" not in result
+    assert result["depth_blocked"] == ["work"]
+    assert result["completed"] == [] and s.reader.calls == 1
+    assert s.state["items"][0]["status"] == "open"
+
+
+def test_forced_scan_overrides_person_skip(tmp_path):
+    """The dashboard's Scan-now button is pressed while sitting at the desk —
+    it must still scan, with the blocked board protected as before."""
+    s = make_syncer(tmp_path)
+    s.update_settings({"tick_confirm": False})
+    s.reconcile({"work": ["task"], "personal": []})
+    s._depth_obstructed = lambda: ["work"]
+    s.reader = SeqReader([TICKED])
+    fake_fetch(s)
+    result = s.scan(force=True)
+    assert "person" not in result
+    assert result["depth_blocked"] == ["work"]
+    assert result["completed"] == [] and s.reader.calls == 1
 
 
 # -- mass-erase guard --------------------------------------------------------
