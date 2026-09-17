@@ -103,6 +103,198 @@ def depth_blocked(stats: Optional[dict]) -> bool:
     if not stats or stats.get("valid_frac", 0) < 0.5 or "p10_mm" not in stats:
         return False
     return stats["p10_mm"] < stats["p90_mm"] - DEPTH_OBSTRUCTION_MM
+# Presence: kinect-knob's /api/presence reports, per REGION, the fraction of
+# it sitting in front of the learned empty plane. That is a different and far
+# more sensitive question than depth_blocked() above asks. depth_blocked
+# compares percentiles WITHIN one frame, so it only fires once an object
+# covers ~10% of a board half — a head leaning in front of a line or two
+# covers a few percent and sails straight through, which is how partially
+# hidden lines kept being transcribed into fragmentary Todoist tasks. Against
+# a learned plane, a few percent is unmistakable.
+PRESENCE_OCCUPANCY = 0.015   # default presence_occupancy setting
+PRESENCE_MARGIN_PX = 120     # widen the asked-about region by this much: a
+                             # head just OUTSIDE the crop is still about to be
+                             # inside it, and its shadow/arm already is
+PRESENCE_POLL_S = 3.0        # background poll cadence (one cheap HTTP call)
+PRESENCE_STALE_S = 30.0      # readings older than this tell us nothing
+
+
+class PresenceWatcher(threading.Thread):
+    """Watches, continuously, whether a human is in front of either board.
+
+    Polling in the background rather than asking once at scan time is the
+    whole point. A scan takes seconds — fetch a stacked photo, run a vision
+    model — and the old single pre-flight check could only ever say "clear a
+    moment ago". Somebody who sat down during the capture, or who had just
+    stood up as it began, produced exactly the half-occluded frame that turns
+    into a fragmentary task. Here the scan can ask "has this board been clear
+    for the last N seconds", and ask again afterwards about the window the
+    photo actually spans.
+
+    Degrades honestly: an unreachable or too-old endpoint reports ``unknown``,
+    never ``clear``, and the caller decides what to do with no evidence.
+    """
+
+    def __init__(self, cfg, settings: dict):
+        super().__init__(name="presence", daemon=True)
+        self.cfg = cfg
+        self._settings = settings
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.started_t = time.time()
+        self.supported: Optional[bool] = None   # None = not yet established
+        self.error: Optional[str] = None
+        # board -> {"occupancy", "blocked", "t", "last_blocked_t", "plane_mm"}
+        self.boards: dict[str, dict] = {}
+        self.scene: dict = {}                   # whole-room presence, if offered
+
+    # -- geometry -------------------------------------------------------
+    def regions(self) -> dict[str, tuple[int, int, int, int]]:
+        """The two board halves, widened by PRESENCE_MARGIN_PX."""
+        x1, y1, x2, y2 = self.cfg.region
+        mid = (x1 + x2) // 2
+        m = PRESENCE_MARGIN_PX
+        return {
+            "work": (x1 - m, y1 - m, mid + m, y2 + m),
+            "personal": (mid - m, y1 - m, x2 + m, y2 + m),
+        }
+
+    # -- polling --------------------------------------------------------
+    def run(self) -> None:
+        while not self._stop.wait(PRESENCE_POLL_S):
+            try:
+                self.poll()
+            except Exception:  # noqa: BLE001 — a watcher must never die
+                log.debug("presence poll failed", exc_info=True)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def poll(self) -> None:
+        if not self.cfg.kinect_url:
+            return
+        threshold = float(self._settings.get("presence_occupancy", PRESENCE_OCCUPANCY))
+        now = time.time()
+        fresh: dict[str, dict] = {}
+        scene: dict = {}
+        for board, (rx1, ry1, rx2, ry2) in self.regions().items():
+            try:
+                r = requests.get(f"{self.cfg.kinect_url}/api/presence",
+                                 params={"x1": rx1, "y1": ry1, "x2": rx2, "y2": ry2},
+                                 timeout=5)
+                if r.status_code == 404:
+                    # Either an older kinect-knob with no /api/presence, or a
+                    # backend with no depth. Either way: fall back.
+                    with self._lock:
+                        self.supported = False
+                        self.error = "kinect-knob has no /api/presence"
+                    return
+                r.raise_for_status()
+                data = r.json()
+            except (requests.RequestException, ValueError) as exc:
+                with self._lock:
+                    self.error = str(exc)
+                return
+            region = data.get("region") or {}
+            occ = float(region.get("occupancy", 0.0))
+            prev = self.boards.get(board, {})
+            blocked = occ >= threshold
+            fresh[board] = {
+                "occupancy": round(occ, 4),
+                "blocked": blocked,
+                "plane_mm": region.get("plane_mm"),
+                "nearest_mm": region.get("nearest_mm"),
+                "t": now,
+                "last_blocked_t": now if blocked else prev.get("last_blocked_t", 0.0),
+            }
+            scene = {"present": bool(data.get("present")),
+                     "occupancy": data.get("occupancy"),
+                     "since_seen_s": data.get("since_seen_s"),
+                     "available": bool(data.get("available"))}
+        with self._lock:
+            self.supported = True
+            self.error = None
+            self.boards = fresh
+            self.scene = scene
+
+    # -- queries --------------------------------------------------------
+    def status(self, board: str) -> str:
+        """'blocked' | 'clear' | 'unknown' — right now."""
+        with self._lock:
+            rec = self.boards.get(board)
+            supported = self.supported
+        if not supported or rec is None:
+            return "unknown"
+        if time.time() - rec["t"] > PRESENCE_STALE_S:
+            return "unknown"
+        return "blocked" if rec["blocked"] else "clear"
+
+    def clear_for_s(self, board: str) -> Optional[float]:
+        """Seconds this board has been continuously clear, or None if unknown."""
+        with self._lock:
+            rec = self.boards.get(board)
+            supported = self.supported
+        if not supported or rec is None or time.time() - rec["t"] > PRESENCE_STALE_S:
+            return None
+        if rec["blocked"]:
+            return 0.0
+        # Never seen blocked: the honest answer is "for as long as I have been
+        # watching", not infinity — a watcher that started ten seconds ago has
+        # not yet earned a thirty-second settle window.
+        last = max(rec.get("last_blocked_t") or 0.0, self.started_t)
+        return time.time() - last
+
+    def blocked_boards(self, min_clear_s: float) -> list[str]:
+        """Boards that are occupied, or that have not been clear long enough.
+
+        ``min_clear_s`` is a settle window: somebody who just stood up is
+        still leaning over the desk, and the frame they left behind is the one
+        with half a sleeve across a line.
+        """
+        out = []
+        for board in ("work", "personal"):
+            state = self.status(board)
+            if state == "blocked":
+                out.append(board)
+                continue
+            if state == "clear":
+                clear = self.clear_for_s(board)
+                if clear is not None and clear < min_clear_s:
+                    out.append(board)
+        return out
+
+    def blocked_since(self, since_t: float) -> list[str]:
+        """Boards somebody stepped in front of at any point since ``since_t``.
+
+        The post-capture question: the photo is already taken, and the only
+        thing that matters is whether anybody was in shot while it was.
+        """
+        out = []
+        with self._lock:
+            supported = self.supported
+            boards = dict(self.boards)
+        if not supported:
+            return []
+        for board, rec in boards.items():
+            if rec.get("last_blocked_t", 0.0) >= since_t:
+                out.append(board)
+        return sorted(out)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            boards = {b: dict(r) for b, r in self.boards.items()}
+            out = {"supported": self.supported, "error": self.error,
+                   "scene": dict(self.scene)}
+        now = time.time()
+        for board, rec in boards.items():
+            rec["age_s"] = round(now - rec["t"], 1)
+            rec["clear_for_s"] = (None if rec["blocked"] else round(
+                now - max(rec.get("last_blocked_t") or 0.0, self.started_t), 1))
+        out["boards"] = boards
+        out["margin_px"] = PRESENCE_MARGIN_PX
+        return out
+
+
 HISTORY_KEEP = 400  # scan/skip records kept in memory and in data/history.jsonl
 
 # Runtime-tunable settings (dashboard toggles, persisted in data/settings.json;
@@ -122,7 +314,11 @@ SETTING_BOUNDS = {
     "tick_confirm": bool,                # re-photograph + re-read before tick completions
     "low_light_boost": bool,             # dim frame -> re-capture with a 32-frame stack
     "depth_guard": bool,                 # ToF depth says a board is physically blocked
-    "depth_skip": bool,                  # someone at a board (ToF) -> skip the scan entirely
+    "depth_skip": bool,                  # someone at a board -> skip the scan entirely
+    "presence_occupancy": (float, 0.002, 0.5),   # region occupancy that counts as "a human is there"
+    "presence_clear_s": (int, 0, 600),           # a board must have been clear this long
+    "presence_recheck": bool,                    # re-check AFTER the photo, not just before
+    "presence_required": bool,                   # no presence evidence -> skip rather than read
     "dim_skip": bool,                    # dim frame -> skip instead of reading protected
     "dim_luma": (int, 10, 150),          # mean luma below which a frame counts as dim
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
@@ -428,9 +624,14 @@ class Syncer:
         self.gate: dict = {}  # last presence-gate skip, for the dashboard
         self.counters = {"scans": 0, "changed": 0, "unchanged": 0, "obstructed": 0,
                          "errors": 0, "added": 0, "completed": 0, "skips_home": 0,
-                         "skips_off": 0, "skips_person": 0, "skips_dim": 0}
+                         "skips_off": 0, "skips_person": 0, "skips_dim": 0,
+                         "skips_person_late": 0}
         self._presence: Optional[str] = None
         self._presence_t = 0.0
+        # Did the last _depth_obstructed() call actually reach the endpoint?
+        # [] means "clear" and "couldn't ask" alike, and those must not be
+        # confused when deciding whether there is any evidence at all.
+        self._depth_ok: Optional[bool] = None
         self._settings_path = cfg.data_dir / "settings.json"
         self.settings = {
             "enabled": True,
@@ -448,6 +649,10 @@ class Syncer:
             "low_light_boost": True,
             "depth_guard": True,
             "depth_skip": True,
+            "presence_occupancy": PRESENCE_OCCUPANCY,
+            "presence_clear_s": 20,
+            "presence_recheck": True,
+            "presence_required": False,
             "dim_skip": True,
             "dim_luma": DIM_LUMA,
             "capture_frames": 8,
@@ -462,6 +667,10 @@ class Syncer:
                     {k: v for k, v in saved.items() if k in self.settings})
             except (json.JSONDecodeError, OSError) as exc:
                 log.warning("settings.json unreadable (%s), using defaults", exc)
+        # Watches, continuously, whether a human is in front of either board.
+        # Started by main(); constructed here so it shares the live settings
+        # dict (threshold changes from the dashboard apply on the next poll).
+        self.watcher = PresenceWatcher(cfg, self.settings)
         self.crop_t: Optional[float] = (
             self.crop_path.stat().st_mtime if self.crop_path.is_file() else None)
         self.history: list[dict] = []
@@ -990,10 +1199,44 @@ class Syncer:
                 stats = r.json()
             except (requests.RequestException, ValueError) as exc:
                 log.debug("region_depth unavailable: %s", exc)
+                self._depth_ok = False
                 return []
             if depth_blocked(stats):
                 blocked.append(board)
+        self._depth_ok = True
         return blocked
+
+    def _presence_blocked(self) -> tuple[list[str], str]:
+        """Boards a human is at — the question, and the evidence for it.
+
+        Returns ``(boards, source)`` where source is "presence" (kinect-knob's
+        region occupancy, the sensitive signal), "depth" (the older
+        percentile guard) or "none" (no evidence at all).
+
+        Occupancy is preferred because the percentile guard cannot see a head.
+        It compares p10 against p90 within a single frame, so it needs an
+        object covering roughly a tenth of a board half before it fires;
+        somebody leaning in front of two or three lines covers a few percent.
+        Those scans read the visible fragments of the hidden lines, the
+        fragments accrued sightings, and the sightings became real Todoist
+        tasks — the failure this method exists to end.
+        """
+        if self.watcher.supported is None:
+            # First scan after boot: don't go in blind, pay one round-trip.
+            try:
+                self.watcher.poll()
+            except Exception:  # noqa: BLE001
+                log.debug("initial presence poll failed", exc_info=True)
+        if self.watcher.supported:
+            return (self.watcher.blocked_boards(self.settings["presence_clear_s"]),
+                    "presence")
+        # No occupancy signal (older kinect-knob, no depth backend, endpoint
+        # unreachable): the percentile guard is weaker but far better than
+        # nothing — it still catches a whole body at a board.
+        blocked = self._depth_obstructed()
+        if blocked or self._depth_ok:
+            return blocked, "depth"
+        return [], "none"
 
     def _tick_completion_imminent(self, seen: dict,
                                   force_protect: tuple = ()) -> bool:
@@ -1016,16 +1259,23 @@ class Syncer:
     def _scan_inner(self, force: bool, dry: bool) -> dict:
         s = self.settings
         if not force and s["depth_skip"]:
-            # Someone physically at a board (per ToF depth, before any photo
-            # is taken): their body hides parts of lines and the model turns
-            # the visible fragments into pending sightings that become real
+            # Someone physically at a board, established BEFORE any photo is
+            # taken: their body hides parts of lines and the model turns the
+            # visible fragments into pending sightings that become real
             # Todoist tasks. Reading through an obstruction has no upside on
             # this cadence — skip and catch up when they step away. Force
             # (the dashboard's Scan-now button) still scans, with the blocked
             # boards protected by the reconcile-time depth guard as before.
-            present = self._depth_obstructed()
+            present, via = self._presence_blocked()
             if present:
-                return {"ok": True, "changed": False, "person": present}
+                return {"ok": True, "changed": False, "person": present,
+                        "person_via": via}
+            if via == "none" and s["presence_required"]:
+                # No evidence either way. Default is to read anyway (the old
+                # behaviour, with every downstream guard still in force); set
+                # presence_required when a silent camera should mean "wait".
+                return {"ok": True, "changed": False, "person_unknown": True}
+        capture_t0 = time.time()
         try:
             jpeg, gray = self._fetch_crop()
         except requests.RequestException as exc:
@@ -1072,6 +1322,18 @@ class Syncer:
         if (not force and s["change_detection"] and not has_pending
                 and diff is not None and diff < s["change_threshold"]):
             return {"ok": True, "changed": False, **base}
+        if not force and s["depth_skip"] and s["presence_recheck"]:
+            # The pre-flight check could only say "clear a moment ago", and a
+            # scan is not instantaneous: fetching a stacked photo takes
+            # seconds, and a 32-frame low-light stack takes longer. Somebody
+            # who sat down WHILE the shutter was open produced exactly the
+            # half-occluded frame the pre-flight check was meant to prevent.
+            # Ask again about the window the photo actually spans — and do it
+            # before the model read, so a ruined frame costs nothing.
+            late = self.watcher.blocked_since(capture_t0)
+            if late:
+                return {"ok": True, "changed": False, "person": late,
+                        "person_late": True, **base}
         try:
             seen = self.reader.read(jpeg)
         except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
@@ -1091,9 +1353,17 @@ class Syncer:
             # confirm_ticks). A failed second read demotes every tick to an
             # open sighting — deferring a completion is always safe.
             seen2 = None
+            confirm_t0 = time.time()
             try:
                 jpeg2, _ = self._fetch_crop()
-                seen2 = self.reader.read(jpeg2)
+                if s["presence_recheck"] and self.watcher.blocked_since(confirm_t0):
+                    # Somebody walked into the confirmation photo. Leaving
+                    # seen2 as None demotes every tick to a plain sighting,
+                    # which is the safe direction.
+                    log.info("someone stepped in during the tick-confirm "
+                             "photo; ticks deferred")
+                else:
+                    seen2 = self.reader.read(jpeg2)
             except Exception as exc:  # noqa: BLE001
                 log.warning("tick-confirm read failed (%s); ticks deferred", exc)
             seen = confirm_ticks(seen, seen2)
@@ -1122,6 +1392,8 @@ class Syncer:
         if not result.get("ok"):
             c["errors"] += 1
         elif result.get("person"):
+            c["skips_person_late" if result.get("person_late") else "skips_person"] += 1
+        elif result.get("person_unknown"):
             c["skips_person"] += 1
         elif result.get("dim_skipped"):
             c["skips_dim"] += 1
@@ -1179,6 +1451,29 @@ class Syncer:
                      "t": round(time.time(), 1), "reason": reason}
         self._record({"type": "skip", "reason": reason})
 
+    def relearn_presence(self) -> tuple[int, dict]:
+        """Make kinect-knob re-learn the empty scene, then re-poll.
+
+        The escape hatch for a board that reads permanently occupied: a box
+        left on the ledge, a chair pushed into shot, the camera nudged. The
+        detector absorbs genuinely motionless objects on its own, but only
+        after a long window (it must not absorb a person working there), so
+        this is the way to say "that is furniture now, get on with it"."""
+        if not self.cfg.kinect_url:
+            return 400, {"error": "no KINECT_URL configured"}
+        try:
+            r = requests.post(f"{self.cfg.kinect_url}/api/presence/relearn", timeout=5)
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            return 502, {"error": f"kinect-knob relearn failed: {exc}"}
+        try:
+            self.watcher.poll()
+        except Exception:  # noqa: BLE001
+            log.debug("post-relearn poll failed", exc_info=True)
+        self._record({"type": "manual", "action": "relearn"})
+        log.info("presence background models relearned by request")
+        return 200, {"ok": True, "watcher": self.watcher.snapshot()}
+
     # -- dashboard --------------------------------------------------------
     def presence_state(self) -> Optional[str]:
         """Presence for the dashboard, cached 30s — the status endpoint is
@@ -1206,6 +1501,7 @@ class Syncer:
                          "gates_scans": bool(cfg.presence_entity)
                                         and self.settings["presence_gate"]},
             "gate": self.gate,
+            "watcher": self.watcher.snapshot(),
             "settings": dict(self.settings),
             "items": self.items_view,
             "last": self.last_result,
@@ -1272,14 +1568,34 @@ button:hover{border-color:var(--axis)} button:disabled{opacity:.45;cursor:defaul
 .card h2 small{color:var(--muted);font-weight:400;float:right}
 ul.items{list-style:none;margin:0;padding:0}
 ul.items li{display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:5px 0;border-top:1px solid var(--grid);font-size:13px}
+  padding:3px 4px;margin:0 -4px;border-top:1px solid var(--grid);font-size:13px;
+  border-radius:7px}
 ul.items li:first-child{border-top:0}
+ul.items li:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
 ul.items li.done .txt{text-decoration:line-through;color:var(--muted)}
-ul.items li .txt{flex:1;overflow-wrap:anywhere}
-ul.items li .end{display:flex;align-items:center;gap:6px;flex:none}
-button.ib{padding:0;width:24px;height:22px;line-height:20px;font-size:13px;
-  border-radius:6px;color:var(--muted);background:transparent}
-button.ib:hover{color:var(--ink);background:var(--surface)}
+ul.items li.busy{opacity:.5;pointer-events:none}
+/* The text IS the edit affordance: one click opens an inline field. The old
+   dashboard put edits behind a blocking window.prompt(), which is slow, ugly
+   and cannot be tabbed through. */
+ul.items li .txt{flex:1;overflow-wrap:anywhere;cursor:text;padding:3px 4px;
+  margin:-3px -4px;border-radius:5px}
+ul.items li .txt:hover{box-shadow:inset 0 -1px 0 var(--axis)}
+ul.items li .txt:focus-visible{outline:2px solid var(--series);outline-offset:1px}
+ul.items li input.edit{flex:1;font:inherit;font-size:13px;color:var(--ink);
+  background:var(--page);border:1px solid var(--series);border-radius:6px;
+  padding:2px 5px;margin:-3px 0;min-width:0;width:100%}
+ul.items li .end{display:flex;align-items:center;gap:4px;flex:none}
+button.ib{padding:0;width:26px;height:24px;line-height:22px;font-size:13px;
+  border-radius:6px;color:var(--muted);background:transparent;border-color:transparent}
+button.ib:hover{color:var(--ink);background:var(--surface);border-color:var(--border)}
+button.ib.danger:hover{color:var(--crit)}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:9;
+  display:none;align-items:center;gap:14px;background:var(--surface);color:var(--ink);
+  border:1px solid var(--axis);border-radius:10px;padding:9px 14px;font-size:13px;
+  box-shadow:0 4px 18px rgba(0,0,0,.18);max-width:min(560px,92vw)}
+#toast .msg{overflow-wrap:anywhere}
+#toast button{padding:3px 11px;font-size:12px}
+.hint{font-size:11px;color:var(--muted);font-weight:400;margin-left:8px}
 .chip{font-size:11px;color:var(--ink2);border:1px solid var(--border);border-radius:999px;
   padding:1px 8px;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
 .chip .dot{width:7px;height:7px}
@@ -1316,6 +1632,7 @@ footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
   <span class="spacer"></span>
   <button id="btn-scan">Scan now</button>
   <button id="btn-dry">Dry run</button>
+  <button id="btn-relearn" title="Tell the camera the boards are empty right now — use after moving the camera, the boards, or anything parked in front of them">Relearn empty boards</button>
 </header>
 <div id="note"></div>
 
@@ -1327,8 +1644,8 @@ footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
 </section>
 
 <div class="grid2">
-  <section class="card"><h2>Work board</h2><ul class="items" id="list-work"></ul></section>
-  <section class="card"><h2>Personal board</h2><ul class="items" id="list-personal"></ul></section>
+  <section class="card"><h2>Work board <span class="hint">click text to edit · Tab for the next · × to delete</span><small id="pres-work"></small></h2><ul class="items" id="list-work"></ul></section>
+  <section class="card"><h2>Personal board<small id="pres-personal"></small></h2><ul class="items" id="list-personal"></ul></section>
 </div>
 
 <section class="card"><h2>Controls <small>changes apply immediately and persist</small></h2>
@@ -1355,6 +1672,9 @@ footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
 
 <footer id="meta"></footer>
 </main>
+<div id="toast" role="status" aria-live="polite">
+  <span class="msg"></span><button id="toast-act" hidden></button>
+</div>
 <script>
 'use strict';
 const $ = (id) => document.getElementById(id);
@@ -1389,8 +1709,15 @@ function outcome(r) {
     ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
   if (r.dark) return 'too dark to read (luma ' + r.luma + ') — skipped';
-  if (r.person) return 'skipped — someone at the ' + r.person.join(' + ') +
-    ' board' + (r.person.length > 1 ? 's' : '') + ' (depth)';
+  if (r.person) return (r.person_late
+      ? 'skipped — someone stepped in front of the ' + r.person.join(' + ') + ' board'
+        + (r.person.length > 1 ? 's' : '') + ' while the photo was being taken'
+      : 'skipped — someone at the ' + r.person.join(' + ') + ' board'
+        + (r.person.length > 1 ? 's' : ''))
+    + (r.person_via === 'depth' ? ' (depth percentiles)' : '');
+  if (r.person_unknown) return 'skipped — no presence evidence from the camera';
+  if (r.type === 'manual' && r.action === 'relearn')
+    return 'camera re-learned the empty boards';
   if (r.dim_skipped) return 'too dim to trust (luma ' + r.luma + ') — skipped';
   if (r.obstructed === true) return 'board obstructed — left alone';  // legacy records
   if (r.changed === false) return 'no change';
@@ -1436,6 +1763,10 @@ const SETTINGS_UI = [
   ['low_light_boost', 'bool', 'Low light: stack 32 frames'],
   ['depth_guard', 'bool', 'Depth guard (ToF obstruction)'],
   ['depth_skip', 'bool', 'Skip scan when someone is at a board'],
+  ['presence_occupancy', 'num', 'Person sensitivity (board coverage)', { min: 0.002, max: 0.5, step: 0.002 }],
+  ['presence_clear_s', 'num', 'Board must be clear for (s)', { min: 0, max: 600, step: 5 }],
+  ['presence_recheck', 'bool', 'Re-check for a person after the photo'],
+  ['presence_required', 'bool', 'Wait when presence is unknown'],
   ['dim_skip', 'bool', 'Skip scan when light is dim'],
   ['dim_luma', 'num', 'Dim threshold (luma 0-255)', { min: 10, max: 150, step: 5 }],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
@@ -1531,54 +1862,8 @@ function render() {
   $('t-last').textContent = last ? ago(last.t) : 'never';
   $('t-last-sub').textContent = last ? outcome(last) : 'no scans since start';
 
-  for (const board of ['work', 'personal']) {
-    const ul = $('list-' + board); ul.textContent = '';
-    const rows = items.filter((i) => i.board === board)
-      .sort((a, b) => (a.pos ?? 1e9) - (b.pos ?? 1e9));  // as written on the board
-    if (!rows.length) { ul.appendChild(el('li', 'empty', 'nothing tracked')); continue; }
-    for (const it of rows) {
-      const li = el('li', it.status === 'done' || it.status === 'removed' ? 'done' : null);
-      li.appendChild(el('span', 'txt', it.text));
-      const end = el('span', 'end');
-      const state = it.status === 'done'
-        ? ['var(--good)', 'done — erase whenever']
-        : it.status === 'removed'
-          ? ['var(--muted)', 'removed — ignored until erased']
-          : it.status === 'pending'
-            ? ['var(--warn)', 'seen ' + it.seen + '/' + st.settings.sightings_to_add +
-               ' — no task yet']
-            : it.ticked > 0
-            ? ['var(--good)', 'ticked ' + it.ticked + '/' + st.settings.ticked_to_complete]
-            : it.missing > 0
-              ? ['var(--serious)', 'missing ' + it.missing + '/' + st.settings.missing_to_complete]
-              : null;
-      if (state) {
-        const chip = el('span', 'chip');
-        const d = el('span', 'dot'); d.style.background = state[0];
-        chip.appendChild(d);
-        chip.appendChild(document.createTextNode(state[1]));
-        end.appendChild(chip);
-      }
-      const be = el('button', 'ib', '\\u270e'); be.title = 'Edit task text';
-      be.addEventListener('click', () => editItem(it));
-      end.appendChild(be);
-      if (it.status === 'done' || it.status === 'removed') {
-        const br = el('button', 'ib', '\\u21a9');
-        br.title = 'Mark as not done — creates a fresh Todoist task';
-        br.addEventListener('click', () => reopenItem(it));
-        end.appendChild(br);
-      }
-      if (it.status !== 'removed') {
-        const bx = el('button', 'ib', '\\u00d7');
-        bx.title = it.status === 'open'
-          ? 'Remove — deletes the Todoist task' : 'Remove from tracking';
-        bx.addEventListener('click', () => removeItem(it));
-        end.appendChild(bx);
-      }
-      li.appendChild(end);
-      ul.appendChild(li);
-    }
-  }
+  lists();
+  presenceChips();
 
   if (st.crop_t) {
     if (st.crop_t !== cropShown) { $('crop').src = '/crop.jpg?t=' + st.crop_t; cropShown = st.crop_t; }
@@ -1592,7 +1877,9 @@ function render() {
   $('counters').textContent = 'since start: ' + c.scans + ' scans · ' + c.changed +
     ' processed · ' + c.unchanged + ' unchanged · ' + c.obstructed + ' obstructed · ' +
     c.errors + ' errors · ' + c.skips_home + ' home-skips · ' + c.skips_off + ' off-skips · ' +
-    (c.skips_person || 0) + ' person-skips · ' + (c.skips_dim || 0) + ' dim-skips';
+    (c.skips_person || 0) + ' person-skips · ' +
+    (c.skips_person_late || 0) + ' spoiled mid-photo · ' +
+    (c.skips_dim || 0) + ' dim-skips';
   $('meta').textContent = 'model ' + cfg.model + ' · crop region ' + cfg.region.join(',') +
     ' · photo: ' + set.capture_frames + ' frames stacked, ' + set.capture_format +
     (set.capture_format === 'jpeg' ? ' q' + set.capture_quality : '') +
@@ -1708,48 +1995,217 @@ function countdown() {
   $('t-next').textContent = mmss(left);
 }
 
-async function itemCall(path, body, okMsg) {
+async function itemCall(path, body, okMsg, it, onOk) {
+  // Mark the row busy immediately so a second click cannot race the first:
+  // edits and deletes take a Home Assistant round-trip, and the scan lock can
+  // hold them for seconds.
+  const key = it ? keyOf(it) : null;
+  if (key) { busyKeys.add(key); lists(); }
+  let ok = false, warning = null;
   try {
     const r = await fetch(path, { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const j = await r.json();
+    ok = !j.error;
+    warning = j.warning || null;
     $('note').textContent = j.error ? 'Failed: ' + j.error
-      : okMsg + (j.warning ? ' — warning: ' + j.warning : '');
+      : (okMsg || '') + (warning ? ' — warning: ' + warning : '');
   } catch (e) { $('note').textContent = 'Request failed: ' + e; }
-  refresh();
+  if (key) busyKeys.delete(key);
+  await refresh();
+  // Outside the try on purpose: a bug in a toast callback must not be
+  // reported to the user as "the request failed" when the request succeeded.
+  if (ok && warning) toast(warning);
+  if (ok && onOk) onOk();
+  return ok;
 }
-function editItem(it) {
-  const nt = prompt(it.status === 'open'
-    ? 'Edit task text (also renames the Todoist task):'
-    : 'Edit tracked text:', it.text);
-  if (nt === null || !nt.trim() || nt.trim() === it.text) return;
-  itemCall('/api/items/edit', { board: it.board, text: it.text, new_text: nt },
-    'Renamed to \\u201c' + nt.trim() + '\\u201d');
+function presenceChips() {
+  // Say plainly, per board, whether the camera can see a person in front of
+  // it — the thing that decides whether a scan happens at all.
+  const w = (st.watcher) || {};
+  for (const board of ['work', 'personal']) {
+    const host = $('pres-' + board);
+    if (!host) continue;
+    if (w.supported === false) { host.textContent = 'no depth presence signal'; continue; }
+    const rec = (w.boards || {})[board];
+    if (!rec || rec.age_s > 30) {
+      host.textContent = w.error ? 'presence unknown — camera unreachable'
+                                 : 'presence unknown';
+      continue;
+    }
+    if (rec.blocked) {
+      host.textContent = 'someone is at this board (' +
+        (rec.occupancy * 100).toFixed(1) + '% covered) — not scanning';
+      continue;
+    }
+    const need = st.settings.presence_clear_s || 0;
+    const clear = rec.clear_for_s;
+    host.textContent = (clear !== null && clear < need)
+      ? 'clear for ' + Math.round(clear) + 's — waiting for ' + need + 's'
+      : 'clear';
+  }
 }
-function reopenItem(it) {
-  const msg = 'Mark \\u201c' + it.text + '\\u201d as not done?\\n\\nCreates a fresh ' +
-    'Todoist task (the old one stays completed/deleted \\u2014 Todoist can\\u2019t ' +
-    'un-complete through Home Assistant). If the checkbox on the BOARD is still ' +
-    'marked, wipe the mark off too \\u2014 otherwise the next scans will just ' +
-    'complete it again.';
-  if (!confirm(msg)) return;
-  itemCall('/api/items/reopen', { board: it.board, text: it.text },
-    'Reopened \\u201c' + it.text + '\\u201d');
+
+// -- item list + inline editing ---------------------------------------------
+// Editing used to go through window.prompt() and deleting through
+// window.confirm(): two blocking modal windows per change, no keyboard flow,
+// and a 5s poll that would rebuild the list underneath you. Now the text IS
+// the field, Enter commits, Tab walks the list, and delete is one click with
+// an undo — so cleaning up a board's worth of OCR wobble takes seconds.
+let editing = null;      // {board, text} while an inline editor is open
+let pendingEdit = null;  // {board, index} -> open an editor after the next build
+let busyKeys = new Set();
+
+const keyOf = (it) => it.board + '\u0000' + it.text;
+
+function itemState(it) {
+  if (it.status === 'done') return ['var(--good)', 'done — erase whenever'];
+  if (it.status === 'removed') return ['var(--muted)', 'removed — ignored until erased'];
+  if (it.status === 'pending')
+    return ['var(--warn)', 'seen ' + it.seen + '/' + st.settings.sightings_to_add + ' — no task yet'];
+  if (it.ticked > 0)
+    return ['var(--good)', 'ticked ' + it.ticked + '/' + st.settings.ticked_to_complete];
+  if (it.missing > 0)
+    return ['var(--serious)', 'missing ' + it.missing + '/' + st.settings.missing_to_complete];
+  return null;
 }
+
+function lists() {
+  // Never rebuild under an open editor: the 5s poll would blow away what is
+  // being typed. Everything else on the page keeps refreshing.
+  if (editing) return;
+  const items = st.items || [];
+  for (const board of ['work', 'personal']) {
+    const ul = $('list-' + board); ul.textContent = '';
+    const rows = items.filter((i) => i.board === board)
+      .sort((a, b) => (a.pos ?? 1e9) - (b.pos ?? 1e9));  // as written on the board
+    if (!rows.length) { ul.appendChild(el('li', 'empty', 'nothing tracked')); continue; }
+    rows.forEach((it, index) => {
+      const cls = [];
+      if (it.status === 'done' || it.status === 'removed') cls.push('done');
+      if (busyKeys.has(keyOf(it))) cls.push('busy');
+      const li = el('li', cls.join(' ') || null);
+
+      const txt = el('span', 'txt', it.text);
+      txt.tabIndex = 0;
+      txt.title = 'Click to edit · Delete to remove';
+      txt.addEventListener('click', () => startEdit(li, it, board, index));
+      txt.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === 'F2') {
+          ev.preventDefault(); startEdit(li, it, board, index);
+        } else if (ev.key === 'Delete') {
+          ev.preventDefault(); removeItem(it);
+        }
+      });
+      li.appendChild(txt);
+
+      const end = el('span', 'end');
+      const state = itemState(it);
+      if (state) {
+        const chip = el('span', 'chip');
+        const d = el('span', 'dot'); d.style.background = state[0];
+        chip.appendChild(d);
+        chip.appendChild(document.createTextNode(state[1]));
+        end.appendChild(chip);
+      }
+      if (it.status === 'done' || it.status === 'removed') {
+        const br = el('button', 'ib', '\u21a9');
+        br.title = 'Mark as not done — creates a fresh Todoist task';
+        br.addEventListener('click', () => reopenItem(it));
+        end.appendChild(br);
+      }
+      if (it.status !== 'removed') {
+        const bx = el('button', 'ib danger', '\u00d7');
+        bx.title = it.status === 'open'
+          ? 'Delete — removes the Todoist task (undoable)' : 'Remove from tracking';
+        bx.addEventListener('click', () => removeItem(it));
+        end.appendChild(bx);
+      }
+      li.appendChild(end);
+      ul.appendChild(li);
+
+      if (pendingEdit && pendingEdit.board === board && pendingEdit.index === index) {
+        pendingEdit = null;
+        startEdit(li, it, board, index);
+      }
+    });
+  }
+  if (pendingEdit) pendingEdit = null;   // that row went away (renamed/removed)
+}
+
+function startEdit(li, it, board, index) {
+  if (editing) return;
+  const txt = li.querySelector('.txt');
+  if (!txt) return;
+  editing = { board: it.board, text: it.text };
+  const inp = el('input', 'edit');
+  inp.type = 'text';
+  inp.value = it.text;
+  inp.setAttribute('aria-label', 'Item text');
+  li.replaceChild(inp, txt);
+  inp.focus();
+  inp.select();
+
+  let settled = false;
+  const finish = (save, thenEdit) => {
+    if (settled) return;
+    settled = true;
+    const next = inp.value.trim();
+    editing = null;
+    if (thenEdit !== undefined) pendingEdit = { board: board, index: thenEdit };
+    if (!save || !next || next === it.text) { lists(); return; }
+    itemCall('/api/items/edit',
+             { board: it.board, text: it.text, new_text: next },
+             'Renamed to \u201c' + next + '\u201d', it);
+  };
+  inp.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+    else if (ev.key === 'Tab') {
+      // Commit and walk: the fast path for fixing up a whole board.
+      ev.preventDefault();
+      finish(true, index + (ev.shiftKey ? -1 : 1));
+    }
+  });
+  inp.addEventListener('blur', () => finish(true));
+}
+
 function removeItem(it) {
-  const msg = it.status === 'open'
-    ? 'Remove \\u201c' + it.text + '\\u201d?\\n\\nDeletes the Todoist task. While the ' +
-      'writing is still on the board the item stays listed as \\u201cremoved\\u201d ' +
-      'so it can\\u2019t be re-added; it disappears once erased.'
-    : it.status === 'pending'
-      ? 'Remove \\u201c' + it.text + '\\u201d? (No Todoist task exists yet — this ' +
-        'just stops it from becoming one.)'
-      : 'Remove \\u201c' + it.text + '\\u201d from tracking? (Its Todoist task is ' +
-        'already completed.)';
-  if (!confirm(msg)) return;
-  itemCall('/api/items/remove', { board: it.board, text: it.text },
-    'Removed \\u201c' + it.text + '\\u201d');
+  // No confirm dialog. Deleting an OPEN item removes its Todoist task, and
+  // reopen puts that task back verbatim — a real undo, so the honest UI is
+  // "do it, offer the undo". The other states touch no live task, so there is
+  // nothing an undo could faithfully restore and none is offered.
+  const undoable = it.status === 'open';
+  itemCall('/api/items/remove', { board: it.board, text: it.text }, null, it,
+           () => undoable
+             ? toast('Deleted \u201c' + it.text + '\u201d', 'Undo',
+                     () => itemCall('/api/items/reopen',
+                                    { board: it.board, text: it.text },
+                                    'Restored \u201c' + it.text + '\u201d', it))
+             : toast(it.status === 'pending'
+                       ? 'Dropped \u201c' + it.text + '\u201d — it had no task yet'
+                       : 'Removed \u201c' + it.text + '\u201d from tracking'));
 }
+
+function reopenItem(it) {
+  itemCall('/api/items/reopen', { board: it.board, text: it.text }, null, it,
+           () => toast('Reopened \u201c' + it.text + '\u201d as a fresh Todoist ' +
+                       'task. If the checkbox is still marked on the board, wipe ' +
+                       'it off — otherwise the next scans just complete it again.'));
+}
+
+let toastTimer = null;
+function toast(msg, actionLabel, onAction, ms) {
+  const box = $('toast'), act = $('toast-act');
+  box.querySelector('.msg').textContent = msg;
+  act.hidden = !actionLabel;
+  act.textContent = actionLabel || '';
+  act.onclick = actionLabel ? () => { hideToast(); onAction(); } : null;
+  box.style.display = 'flex';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, ms || (actionLabel ? 9000 : 5000));
+}
+function hideToast() { clearTimeout(toastTimer); $('toast').style.display = 'none'; }
 
 async function doScan(dry) {
   $('btn-scan').disabled = $('btn-dry').disabled = true;
@@ -1763,6 +2219,16 @@ async function doScan(dry) {
   $('btn-scan').disabled = $('btn-dry').disabled = false;
   refresh();
 }
+$('btn-relearn').addEventListener('click', async () => {
+  const b = $('btn-relearn'); b.disabled = true;
+  try {
+    const j = await (await fetch('/api/presence/relearn', { method: 'POST' })).json();
+    toast(j.error ? 'Relearn failed: ' + j.error
+                  : 'The camera has re-learned the empty boards.');
+  } catch (e) { toast('Relearn failed: ' + e); }
+  b.disabled = false;
+  refresh();
+});
 $('btn-scan').addEventListener('click', () => doScan(false));
 $('btn-dry').addEventListener('click', () => doScan(true));
 
@@ -1832,6 +2298,13 @@ def serve_http(syncer: Syncer) -> None:
                     self._json(400, {"error": f"bad body: {exc}"})
                     return
                 self._json(200, syncer.update_settings(patch))
+            elif url.path == "/api/presence/relearn":
+                # Ask kinect-knob to forget the learned empty-board plane.
+                # Needed after the camera or the boards move — and the escape
+                # hatch if something parked in front of a board has latched it
+                # "occupied" and scans have stopped.
+                code, resp = syncer.relearn_presence()
+                self._json(code, resp)
             elif url.path in ("/api/items/edit", "/api/items/remove",
                               "/api/items/reopen"):
                 length = int(self.headers.get("Content-Length") or 0)
@@ -1875,6 +2348,10 @@ def main() -> None:
     except requests.RequestException as exc:
         log.warning("ollama not reachable at %s: %s", cfg.ollama_url, exc)
     syncer = Syncer(cfg, ha, reader)
+    # Watch for a human at the boards continuously, not once per scan: the
+    # question "was anybody in shot while that photo was taken" cannot be
+    # answered by a check that ran before it.
+    syncer.watcher.start()
     threading.Thread(target=serve_http, args=(syncer,), daemon=True).start()
     log.info("whiteboard-sync up: model %s, every %ss while %s is away; region %s; "
              "dashboard on :%s", cfg.model, cfg.interval_s,

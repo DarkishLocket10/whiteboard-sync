@@ -85,6 +85,52 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   512×424 over the full FOV leaves ~150px for both boards, and the
   coloured inks are near-invisible at 860nm (verified with
   `/api/snapshot?ir=1` 2026-07-09).
+- **Presence, rebuilt 2026-09-17.** `depth_skip` still names the behaviour,
+  but the evidence is now kinect-knob's `GET /api/presence?x1&y1&x2&y2`:
+  the FRACTION of a board region sitting in front of its learned empty
+  plane. The old `region_depth` percentile test (still the fallback for an
+  older kinect-knob, via `_presence_blocked()` -> `_depth_obstructed()`)
+  compares p10 against p90 within one frame, so it needs an object covering
+  ~10% of a board half before it fires — a head leaning in front of two or
+  three lines covers a few percent and sailed straight through. Measured on
+  the live sensor 2026-09-17: a CLEAR board half reads occupancy 0.00003
+  against a 0.015 threshold, so the margin is enormous.
+- Three changes make the guard actually hold, and all three matter:
+  1. **A background `PresenceWatcher` thread** polls every 3 s instead of the
+     scan asking once. A one-shot pre-flight check can only ever report
+     "clear a moment ago".
+  2. **A settle window** (`presence_clear_s`, default 20 s): a board must have
+     been continuously clear for that long. Somebody who just stood up is
+     still leaning over the desk.
+  3. **A post-capture re-check** (`presence_recheck`, default on): after the
+     photo, `blocked_since(capture_t0)` asks whether anybody was in shot
+     *while the shutter was open* — a stacked photo takes seconds and a
+     32-frame low-light stack longer. It runs BEFORE the model read, so a
+     spoiled frame costs nothing. The tick-confirm photo gets the same
+     treatment; somebody walking into it leaves `seen2` None, which demotes
+     every tick to a plain sighting (the safe direction).
+- The region asked about is the board half widened by `PRESENCE_MARGIN_PX`
+  (120 px): a head just outside the crop is about to be inside it, and the
+  arm already is.
+- No evidence (endpoint unreachable, no depth backend) reads as `"none"`, never
+  as "clear". The default is still to scan (every downstream guard applies);
+  `presence_required` makes it wait instead.
+- Escape hatch: the detector only absorbs a genuinely motionless object into
+  the board plane after a long window, deliberately, so that somebody working
+  at a board is never absorbed. If something parked in front of a board latches
+  it "occupied", the dashboard's **Relearn empty boards** button
+  (`POST /api/presence/relearn` -> kinect-knob) clears the model.
+- Dashboard list editing was rebuilt at the same time: the text IS the input
+  (click or Enter to edit, Enter commits, Esc cancels, Tab commits and walks to
+  the next item), delete is one click with an Undo toast, and nothing goes
+  through `window.prompt`/`confirm` any more. Two rules keep it honest — the
+  5 s poll never rebuilds the list while an editor is open (`editing` guard in
+  `lists()`), and a row with a request in flight is marked busy so a second
+  click cannot race the first. Undo is offered ONLY for `open` items, where
+  remove-then-reopen restores the Todoist task verbatim; for the other statuses
+  removal touches no live task and there is nothing an undo could faithfully
+  restore.
+
 - Depth presence SKIP (2026-07-13, `depth_skip` toggle, default on): a
   scheduled scan first asks `_depth_obstructed()` BEFORE taking a photo;
   if someone is physically at either board the scan is skipped outright

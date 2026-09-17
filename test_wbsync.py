@@ -1203,3 +1203,271 @@ def test_true_board_wipe_still_completes_at_normal_threshold(tmp_path):
     r = s.reconcile({"work": [], "personal": []})    # miss 2: real wipe, no slowdown
     assert sorted(r["completed"]) == sorted(texts) and r["slowed"] == []
     assert s.state["items"] == []
+
+
+# ---------------------------------------------------------------------------
+# Presence: "don't scan while a human is in front of the board"
+#
+# The old guard asked kinect-knob's region_depth whether p10 sat 400mm in
+# front of p90 — a test that needs an object covering ~10% of a board half.
+# A head leaning in front of two lines covers a few percent, so it read
+# "clear", the model transcribed the fragments it could see, and the
+# fragments became Todoist tasks. These cover the replacement.
+# ---------------------------------------------------------------------------
+import time as _time
+
+from wbsync import PresenceWatcher
+
+
+class FakePresenceAPI:
+    """Stands in for kinect-knob's /api/presence."""
+
+    def __init__(self, occupancy=0.0, status=200, raises=False):
+        self.occupancy = occupancy          # float, or {board_x1: float}
+        self.status = status
+        self.raises = raises
+        self.calls = []
+
+    def __call__(self, url, params=None, timeout=None):
+        self.calls.append(params)
+        if self.raises:
+            raise __import__("requests").RequestException("boom")
+        occ = self.occupancy
+        if isinstance(occ, dict):
+            occ = occ.get(params["x1"], 0.0)
+
+        class R:
+            status_code = self.status
+
+            def raise_for_status(_self):
+                if self.status >= 400:
+                    raise __import__("requests").HTTPError(str(self.status))
+
+            def json(_self):
+                return {"present": occ > 0, "occupancy": occ, "available": True,
+                        "region": {"occupancy": occ, "plane_mm": 1950,
+                                   "nearest_mm": 1200 if occ else None,
+                                   "valid_frac": 0.99, "age_s": 0.2}}
+        return R()
+
+
+def make_watcher(monkeypatch, api, region=(600, 280, 1320, 810), settings=None):
+    cfg = type("C", (), {"kinect_url": "http://kk", "region": region})()
+    w = PresenceWatcher(cfg, settings or {"presence_occupancy": 0.015})
+    monkeypatch.setattr("wbsync.requests.get", api)
+    return w
+
+
+def test_watcher_asks_about_both_board_halves_with_a_margin(monkeypatch):
+    """A head just OUTSIDE the crop is about to be inside it, and its arm
+    already is — so the region asked about is wider than the crop."""
+    api = FakePresenceAPI()
+    w = make_watcher(monkeypatch, api)
+    regions = w.regions()
+    assert set(regions) == {"work", "personal"}
+    (wx1, wy1, wx2, wy2) = regions["work"]
+    assert wx1 == 600 - 120 and wy1 == 280 - 120
+    assert wx2 == 960 + 120 and wy2 == 810 + 120
+    assert regions["personal"][0] == 960 - 120
+    assert regions["personal"][2] == 1320 + 120
+
+
+def test_a_head_sized_occupancy_blocks_the_board(monkeypatch):
+    """4% of a board half — invisible to the percentile guard, decisive here."""
+    w = make_watcher(monkeypatch, FakePresenceAPI(occupancy=0.04))
+    w.poll()
+    assert w.supported is True
+    assert w.status("work") == "blocked"
+    assert w.blocked_boards(min_clear_s=0) == ["work", "personal"]
+
+
+def test_a_clear_board_is_clear(monkeypatch):
+    w = make_watcher(monkeypatch, FakePresenceAPI(occupancy=0.0001))
+    w.poll()
+    assert w.status("work") == "clear"
+    assert w.blocked_boards(min_clear_s=0) == []
+
+
+def test_only_the_occupied_half_is_blocked(monkeypatch):
+    """Sitting at the work board must not stop the personal board being read
+    — except that it does, by the pre-existing whole-scan skip. What matters
+    here is that the SIGNAL is per board."""
+    api = FakePresenceAPI(occupancy={600 - 120: 0.05, 960 - 120: 0.0})
+    w = make_watcher(monkeypatch, api)
+    w.poll()
+    assert w.status("work") == "blocked"
+    assert w.status("personal") == "clear"
+
+
+def test_a_board_must_be_clear_for_the_settle_window(monkeypatch):
+    """Somebody who just stood up is still leaning over the desk."""
+    w = make_watcher(monkeypatch, FakePresenceAPI(occupancy=0.05))
+    w.poll()                                   # blocked now
+    w._settings["presence_occupancy"] = 0.015
+    api2 = FakePresenceAPI(occupancy=0.0)
+    import wbsync
+    wbsync.requests.get = api2
+    w.poll()                                   # clear, but only just
+    assert w.status("work") == "clear"
+    assert w.blocked_boards(min_clear_s=30) == ["work", "personal"]
+    assert w.blocked_boards(min_clear_s=0) == []
+
+
+def test_blocked_since_answers_about_the_photo_window(monkeypatch):
+    """The post-capture question: was anybody in shot WHILE that photo was
+    taken? A pre-flight check can never answer it."""
+    w = make_watcher(monkeypatch, FakePresenceAPI(occupancy=0.0))
+    w.poll()
+    t_capture = _time.time()
+    import wbsync
+    wbsync.requests.get = FakePresenceAPI(occupancy=0.05)
+    w.poll()                                   # somebody arrived mid-capture
+    assert w.blocked_since(t_capture) == ["personal", "work"]
+    assert w.blocked_since(_time.time() + 10) == []
+
+
+def test_missing_endpoint_is_reported_not_guessed(monkeypatch):
+    """An older kinect-knob has no /api/presence. That must read as 'no
+    occupancy signal', never as 'nobody is there'."""
+    w = make_watcher(monkeypatch, FakePresenceAPI(status=404))
+    w.poll()
+    assert w.supported is False
+    assert w.status("work") == "unknown"
+    assert w.blocked_boards(min_clear_s=0) == []
+
+
+def test_unreachable_endpoint_reads_unknown(monkeypatch):
+    w = make_watcher(monkeypatch, FakePresenceAPI(raises=True))
+    w.poll()
+    assert w.status("work") == "unknown"
+    assert w.error
+
+
+def test_stale_readings_read_unknown(monkeypatch):
+    w = make_watcher(monkeypatch, FakePresenceAPI(occupancy=0.0))
+    w.poll()
+    assert w.status("work") == "clear"
+    for rec in w.boards.values():
+        rec["t"] -= 120                        # older than PRESENCE_STALE_S
+    assert w.status("work") == "unknown"
+    assert w.clear_for_s("work") is None
+
+
+# -- how the syncer uses it -------------------------------------------------
+
+
+def _stub_watcher(s, blocked=(), late=(), supported=True):
+    s.watcher.supported = supported
+    s.watcher.blocked_boards = lambda min_clear_s: list(blocked)
+    s.watcher.blocked_since = lambda since_t: list(late)
+
+
+def test_occupancy_is_preferred_over_the_percentile_guard(tmp_path):
+    s = make_syncer(tmp_path)
+    _stub_watcher(s, blocked=["work"])
+    s._depth_obstructed = lambda: pytest.fail("should not fall back to depth")
+    assert s._presence_blocked() == (["work"], "presence")
+
+
+def test_the_percentile_guard_still_covers_an_older_kinect_knob(tmp_path):
+    s = make_syncer(tmp_path)
+    s.watcher.supported = False
+    s._depth_obstructed = lambda: ["personal"]
+    s._depth_ok = True
+    assert s._presence_blocked() == (["personal"], "depth")
+
+
+def test_no_evidence_is_reported_as_no_evidence(tmp_path):
+    s = make_syncer(tmp_path)
+    s.watcher.supported = False
+    s._depth_obstructed = lambda: []
+    s._depth_ok = False
+    assert s._presence_blocked() == ([], "none")
+
+
+def test_presence_skip_takes_no_photo(tmp_path):
+    s = make_syncer(tmp_path)
+    _stub_watcher(s, blocked=["work"])
+    s.reader = SeqReader([])
+    fetches = []
+    s._fetch_crop = lambda frames=None: fetches.append(frames)
+    result = s.scan()
+    assert result["ok"] is True and result["changed"] is False
+    assert result["person"] == ["work"] and result["person_via"] == "presence"
+    assert fetches == [] and s.reader.calls == 0
+    assert s.counters["skips_person"] == 1
+
+
+def test_somebody_who_arrives_during_the_photo_voids_it(tmp_path):
+    """THE regression. The pre-flight check said clear; he sat down while the
+    stack was being captured; the old code read the photo anyway and turned
+    his half-hidden lines into tasks. The re-check must throw the frame away
+    — and before the model read, so a ruined frame costs nothing."""
+    s = make_syncer(tmp_path)
+    _stub_watcher(s, blocked=[], late=["work"])
+    fake_fetch(s)
+    s.reader = SeqReader([])                   # any read would blow up
+    result = s.scan()
+    assert result["ok"] is True and result["changed"] is False
+    assert result["person"] == ["work"] and result["person_late"] is True
+    assert s.reader.calls == 0
+    assert s.counters["skips_person_late"] == 1
+
+
+def test_the_recheck_can_be_turned_off(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"presence_recheck": False, "tick_confirm": False})
+    _stub_watcher(s, blocked=[], late=["work"])
+    fake_fetch(s)
+    s.reader = FixedReader({"work": ["Fix dashboard"], "personal": []})
+    result = s.scan()
+    assert result["changed"] is True
+
+
+def test_a_forced_scan_ignores_presence(tmp_path):
+    """The dashboard's Scan-now button means now."""
+    s = make_syncer(tmp_path)
+    s.update_settings({"tick_confirm": False})
+    _stub_watcher(s, blocked=["work"], late=["work"])
+    fake_fetch(s)
+    s.reader = FixedReader({"work": ["Fix dashboard"], "personal": []})
+    result = s.scan(force=True)
+    assert result["changed"] is True
+
+
+def test_presence_required_waits_when_there_is_no_evidence(tmp_path):
+    """Opt-in strictness: a silent camera means 'wait', not 'read anyway'."""
+    s = make_syncer(tmp_path)
+    s.update_settings({"presence_required": True})
+    s.watcher.supported = False
+    s._depth_obstructed = lambda: []
+    s._depth_ok = False
+    fetches = []
+    s._fetch_crop = lambda frames=None: fetches.append(frames)
+    result = s.scan()
+    assert result["person_unknown"] is True
+    assert fetches == []
+
+
+def test_without_presence_required_no_evidence_still_scans(tmp_path):
+    """Default stays backward compatible: every downstream guard still runs."""
+    s = make_syncer(tmp_path)
+    s.update_settings({"tick_confirm": False})
+    s.watcher.supported = False
+    s._depth_obstructed = lambda: []
+    s._depth_ok = False
+    fake_fetch(s)
+    s.reader = FixedReader({"work": ["Fix dashboard"], "personal": []})
+    assert s.scan()["changed"] is True
+
+
+def test_a_freshly_started_watcher_has_not_earned_a_settle_window(monkeypatch):
+    """"Never seen anybody" is not the same as "clear for hours". A watcher
+    that came up ten seconds ago cannot vouch for the preceding minute."""
+    w = make_watcher(monkeypatch, FakePresenceAPI(occupancy=0.0))
+    w.poll()
+    assert w.clear_for_s("work") < 5
+    assert w.blocked_boards(min_clear_s=60) == ["work", "personal"]
+    w.started_t -= 600
+    assert w.clear_for_s("work") > 595
+    assert w.blocked_boards(min_clear_s=60) == []
