@@ -3,8 +3,9 @@ import json
 
 import pytest
 
-from wbsync import (Config, Syncer, confirm_ticks, depth_blocked,
-                    fuzzy_match, normalise_read, parse_region)
+from wbsync import (ASSIGN_FLOOR, Config, Syncer, assign_matches,
+                    confirm_ticks, depth_blocked, fuzzy_match, match_score,
+                    norm_for_match, normalise_read, parse_region)
 
 
 class FakeHA:
@@ -63,6 +64,77 @@ def test_fuzzy_match_tolerates_ocr_wobble():
     known = ["Bluetooth Adapter", "do laundry"]
     assert fuzzy_match("bluetooth adaptor", known) == "Bluetooth Adapter"
     assert fuzzy_match("completely different", known) is None
+
+
+def test_word_internal_dot_reads_back_as_an_i():
+    # This writer's lowercase "i" is a detached dot with no stem, so the model
+    # transcribes it as a period. All of these are real reads off the boards.
+    assert norm_for_match("Organ.ze K.tchen Sp.ces") == norm_for_match(
+        "Organize Kitchen Spices")
+    assert norm_for_match("Rev.ew") == norm_for_match("Review")
+    assert norm_for_match('Make AI roleplays "n.cer"') == norm_for_match(
+        'Make AI roleplays "nicer"')
+    # A trailing period is punctuation, not a letter, and must not become "i".
+    assert norm_for_match("Send invoice.") == "send invoice"
+
+
+def test_truncated_reads_still_match_their_item():
+    # Fragments that used to fall off the 0.8 cliff, complete the real task
+    # and re-add themselves as a duplicate. "Europe Express Change Request!"
+    # churned six add/complete cycles this way.
+    for whole, fragment in [
+            ("Update Flight RISK ticket", "Update Flight"),
+            ("Remove Amplitude tracking", "Remove Ampli+"),
+            ("Europe Express Change Request!", "pe Express"),
+            ("Europe Express Change Request!", "nge Request!")]:
+        assert match_score(whole, fragment) >= ASSIGN_FLOOR, (whole, fragment)
+
+
+def test_lightly_reworded_item_still_matches():
+    # The user rewords for clarity when rewriting; this pair caused a real
+    # false completion plus a duplicate task on 2026-09-21.
+    assert match_score("Add LOOPS logging to Posthog",
+                       "Implement Loops logging via Posthog") >= ASSIGN_FLOOR
+
+
+def test_unrelated_items_do_not_match():
+    for a, b in [("Send Invoice", "Clean fridge"),
+                 ("Buy milk", "Buy cake"),
+                 ("Organize Kitchen Spices", "Clean fridge")]:
+        assert match_score(a, b) < ASSIGN_FLOOR, (a, b)
+
+
+def test_assignment_is_one_to_one_and_prefers_the_better_pair():
+    known = ["Update Flight RISK ticket", "Update Laura's Small ticket"]
+    # Both reads look like both items; assignment must not give either item
+    # to two lines, and each line must land on its own best partner.
+    got = assign_matches(["Update Flight", "Update Laura's"], known)
+    assert got["Update Flight"] == "Update Flight RISK ticket"
+    assert got["Update Laura's"] == "Update Laura's Small ticket"
+    assert len(set(got.values())) == 2
+
+
+def test_assignment_leaves_genuinely_new_text_unmatched():
+    known = ["Clean fridge", "Send Invoice"]
+    got = assign_matches(["Clean fridge", "Book dentist appointment"], known)
+    assert got["Clean fridge"] == "Clean fridge"
+    assert "Book dentist appointment" not in got
+
+
+def test_reworded_item_neither_completes_nor_duplicates(tmp_path):
+    # End to end: an item rewritten with different wording must stay the SAME
+    # tracked item - no completion, no second Todoist task.
+    s = make_syncer(tmp_path)
+    fake_fetch(s)
+    s.reconcile({"work": ["Add LOOPS logging to Posthog"], "personal": []})
+    assert [i["text"] for i in s.state["items"]] == ["Add LOOPS logging to Posthog"]
+    s.ha.calls.clear()
+    res = s.reconcile({"work": ["Implement Loops logging via Posthog"],
+                       "personal": []})
+    assert res["added"] == [] and res["completed"] == []
+    assert len(s.state["items"]) == 1
+    assert s.state["items"][0]["missing"] == 0
+    assert s.ha.calls == []
 
 
 def test_new_items_create_tagged_todoist_tasks(tmp_path):

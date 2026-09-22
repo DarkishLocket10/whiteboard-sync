@@ -46,6 +46,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -550,12 +551,115 @@ class BoardReader:
         return normalise_read(json.loads(content))
 
 
+# --------------------------------------------------------------- matching
+# This writer's lowercase "i" is a tiny detached dot with almost no stem, so
+# the model regularly transcribes it as a period: "Organ.ze K.tchen Sp.ces",
+# "Rev.ew", "Ed.t", "F.n.sh", "n.cer" are all real reads off these boards. A
+# period BETWEEN two letters is never punctuation in a to-do phrase, so it is
+# safe to read it back as an "i" — but for COMPARISON ONLY. Stored text stays
+# byte-identical to the Todoist summary (see CLAUDE.md), so this never
+# rewrites an item from a guess; it only stops the drift breaking a match.
+_DOT_AS_I = re.compile(r"(?<=[A-Za-z])[.,](?=[A-Za-z])")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+# A truncated read is scored by CONTAINMENT, not edit distance.
+MIN_CONTAINMENT_CHARS = 6
+CONTAINMENT_SCORE = 0.92
+# Floor for the one-to-one assignment. Lower than FUZZY_MATCH_RATIO on
+# purpose: pairing the read as a SET means a weak pair is only accepted when
+# nothing better competes for either side, so the hard 0.8 cliff is no longer
+# what protects against mismatches.
+#
+# No threshold separates every case cleanly. Measured on this board's real
+# history: a legitimate reword ("Add LOOPS logging to Posthog" -> "Implement
+# Loops logging via Posthog") scores 0.730, while two GENUINELY different
+# items that share vocabulary ("Work on role play generation" vs "Break down
+# Role Play Version 3") score 0.724 — six thousandths apart. Assignment is
+# what carries it rather than the number: when both of those items are on the
+# board each matches ITSELF at ~1.0 and wins its pairing, so the confusable
+# pair only forms when one of them is absent from the read entirely. That
+# leaves the item uncreated for one scan and self-corrects on the next; the
+# sightings_to_add and mass-erase guards still sit behind it.
+ASSIGN_FLOOR = 0.68
+# Vertical position is a tie-breaker only. The user reorders items by erasing
+# and rewriting them, so distance must never PENALISE a pair.
+POSITION_BONUS = 0.08
+
+
+def norm_for_match(text: str) -> str:
+    """Comparison-only normalisation. Never stored, never sent to Todoist."""
+    return _NON_ALNUM.sub(" ", _DOT_AS_I.sub("i", text).lower()).strip()
+
+
+def match_score(a: str, b: str) -> float:
+    """How likely two texts are the same board item, 0..1.
+
+    Truncation is scored by containment rather than edit ratio. A read that
+    lost its start or end — "Update Flight" for "Update Flight RISK ticket",
+    "Remove Ampli+" for "Remove Amplitude tracking", "pe Express" for "Europe
+    Express Change Request!" — scores only 0.50-0.68 by SequenceMatcher and
+    used to fall off the 0.8 cliff, which completed the real task and re-added
+    the fragment as a new one. "Europe Express Change Request!" churned six
+    add/complete cycles that way.
+    """
+    na, nb = norm_for_match(a), norm_for_match(b)
+    if not na or not nb:
+        return 0.0
+    short, long_ = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(short) >= MIN_CONTAINMENT_CHARS and short in long_:
+        return CONTAINMENT_SCORE
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def assign_matches(reads: list[str], known: list[str],
+                   read_pos: Optional[dict] = None,
+                   known_pos: Optional[dict] = None,
+                   floor: float = ASSIGN_FLOOR) -> dict[str, str]:
+    """Pair this read's lines one-to-one with the tracked items.
+
+    The old path matched each read line independently against the whole known
+    list and took its own best hit above a hard 0.8. Two failure modes came
+    out of that: a lightly reworded line ("Add LOOPS logging to Posthog" ->
+    "Implement Loops logging via Posthog", ratio 0.73) fell off the cliff and
+    became a false completion PLUS a duplicate task; and two read lines could
+    both claim the same tracked item.
+
+    Pairing the read against the list as a SET fixes both. The strongest pairs
+    are taken first and the remainder match by elimination, so one badly
+    drifted line still lands on its real item instead of orphaning it. The
+    user both reorders items and lightly rewords them, so text carries the
+    decision and position only breaks ties.
+    """
+    read_pos = read_pos or {}
+    known_pos = known_pos or {}
+    scored = []
+    for r in reads:
+        for k in known:
+            s = match_score(r, k)
+            if s < floor:
+                continue
+            if r in read_pos and k in known_pos:
+                s += POSITION_BONUS / (1.0 + abs(read_pos[r] - known_pos[k]))
+            scored.append((s, r, k))
+    scored.sort(key=lambda p: -p[0])
+    out: dict[str, str] = {}
+    used_r: set[str] = set()
+    used_k: set[str] = set()
+    for _s, r, k in scored:
+        if r in used_r or k in used_k:
+            continue
+        out[r] = k
+        used_r.add(r)
+        used_k.add(k)
+    return out
+
+
 def fuzzy_match(needle: str, haystack: list[str]) -> Optional[str]:
     """Best fuzzy match for OCR'd text, or None. Handwriting reads vary
     slightly between scans; exact matching would duplicate tasks."""
     best, best_ratio = None, 0.0
     for candidate in haystack:
-        ratio = difflib.SequenceMatcher(None, needle.lower(), candidate.lower()).ratio()
+        ratio = match_score(needle, candidate)
         if ratio > best_ratio:
             best, best_ratio = candidate, ratio
     return best if best_ratio >= FUZZY_MATCH_RATIO else None
@@ -993,9 +1097,33 @@ class Syncer:
                 order_idx.setdefault(t.strip(), i)
             pos_seen: dict[str, int] = {}  # canonical text -> board position
 
+            # Pair the WHOLE read against the WHOLE tracked list in one go,
+            # before deciding anything. Matching line-by-line let a reworded
+            # line orphan its item (completion + duplicate) and let two lines
+            # claim the same item; assignment resolves both globally.
+            known_pos = {i["text"]: i.get("pos", 0) for i in known}
+            assigned = assign_matches(seen_open + seen_done, known_texts,
+                                      order_idx, known_pos)
+            taken = set(assigned.values())
+
+            def _match_for(text: str) -> Optional[str]:
+                """Assigned partner, else a fallback among items still free.
+
+                The fallback keeps two existing behaviours: items appended to
+                ``known_texts`` DURING this scan (new pendings) are matchable,
+                and nothing already claimed can be claimed twice.
+                """
+                hit = assigned.get(text)
+                if hit is None:
+                    hit = fuzzy_match(text, [t for t in known_texts
+                                             if t not in taken])
+                if hit is not None:
+                    taken.add(hit)
+                return hit
+
             open_matched, done_matched = set(), set()
             for text in seen_open:
-                match = fuzzy_match(text, known_texts)
+                match = _match_for(text)
                 if match is not None:
                     open_matched.add(match)  # keep canonical text (= Todoist summary)
                     pos_seen[match] = order_idx.get(text, len(order_idx))
@@ -1022,7 +1150,7 @@ class Syncer:
                 else:
                     failed += 1
             for text in seen_done:
-                match = fuzzy_match(text, known_texts)
+                match = _match_for(text)
                 if match is not None:
                     done_matched.add(match)
                     pos_seen[match] = order_idx.get(text, len(order_idx))
