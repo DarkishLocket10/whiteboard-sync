@@ -189,3 +189,19 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   must never try to open the Kinect itself — always go through the snapshot
   endpoint. If snapshots 404, kinect-knob was probably restarted seconds ago
   (USB-stall recovery) — the next interval will succeed.
+
+- **Framing (2026-10-02, branch `manual-framing`).** The Kinect has no
+  optical zoom/pan, so the crop rectangle IS the zoom and pan. `region`
+  (x1,y1,x2,y2 in the 1920x1080 frame) and `split` (x dividing work|personal
+  for the presence/depth guards; 0 = midpoint — the model itself tells left
+  from right) are live settings in `data/settings.json`; `WB_REGION` is only
+  the default and the dashboard's **Default** button. Edit them in the
+  dashboard's *Camera framing* card: drag/resize the box over the live frame
+  (`GET /api/frame`), drag the dashed divider, and judge a draft with
+  **Preview model view** / **Test read** (`POST /api/framing/preview`, body =
+  draft framing keys + `read`) — the preview touches no state, baseline,
+  dashboard crop or Todoist. The image settings (enhance, frames, upscale,
+  format, JPEG quality) moved into that card and save together with the box.
+  Saving a new region deletes `baseline.npy` so the next scan reads fresh.
+  Upscale is 1–3x but clamped to `MODEL_MAX_PIXELS` (1.6 MP, the known-good
+  size for `num_ctx 6144`); raise `num_ctx` before raising that cap.

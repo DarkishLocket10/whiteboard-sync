@@ -119,6 +119,34 @@ PRESENCE_MARGIN_PX = 120     # widen the asked-about region by this much: a
 PRESENCE_POLL_S = 3.0        # background poll cadence (one cheap HTTP call)
 PRESENCE_STALE_S = 30.0      # readings older than this tell us nothing
 
+# Framing. The Kinect v2 colour camera has no optical zoom, pan or exposure
+# control the service can use, so "zoom" and "pan" are the crop rectangle cut
+# from the fixed 1920x1080 frame — a tighter crop spends the model's pixel
+# budget on the boards instead of the wall above them.
+FRAME_W, FRAME_H = 1920, 1080
+MIN_REGION_W, MIN_REGION_H = 160, 120   # smaller is a slip of the mouse
+# The largest image ever sent to the model. The default 720x530 crop at 2x
+# (1440x1060, ~1.53 MP) is known to fit num_ctx 6144 together with the
+# prompt; a bigger image silently truncates the prompt (see OllamaReader), so
+# upscaling is clamped to this rather than trusted.
+MODEL_MAX_PIXELS = 1_600_000
+
+
+def board_split(region: tuple[int, int, int, int], split: int = 0) -> int:
+    """The x (full-frame px) dividing the work board from the personal one.
+    0 — or anything outside the region — means the region's midpoint. Only
+    the presence and depth guards use it; the model itself sees the whole
+    crop and tells left from right on its own."""
+    x1, _, x2, _ = region
+    return split if x1 < split < x2 else (x1 + x2) // 2
+
+
+def model_scale(w: int, h: int, upscale: float) -> float:
+    """The resize factor actually applied before the model: the requested
+    upscale, clamped so the result stays within MODEL_MAX_PIXELS (which
+    shrinks a crop that is already bigger than that)."""
+    return min(float(upscale), (MODEL_MAX_PIXELS / max(1, w * h)) ** 0.5)
+
 
 class PresenceWatcher(threading.Thread):
     """Watches, continuously, whether a human is in front of either board.
@@ -153,7 +181,7 @@ class PresenceWatcher(threading.Thread):
     def regions(self) -> dict[str, tuple[int, int, int, int]]:
         """The two board halves, widened by PRESENCE_MARGIN_PX."""
         x1, y1, x2, y2 = self.cfg.region
-        mid = (x1 + x2) // 2
+        mid = board_split(self.cfg.region, self._settings.get("split", 0))
         m = PRESENCE_MARGIN_PX
         return {
             "work": (x1 - m, y1 - m, mid + m, y2 + m),
@@ -324,9 +352,14 @@ SETTING_BOUNDS = {
     "dim_luma": (int, 10, 150),          # mean luma below which a frame counts as dim
     "capture_frames": (int, 1, 32),      # frames stacked by kinect-knob per photo
     "capture_quality": (int, 50, 100),   # JPEG quality sent to the vision model
-    "upscale": (int, 1, 2),              # LANCZOS upscale factor before the model
+    "upscale": (float, 1.0, 3.0),        # LANCZOS upscale before the model (capped, see MODEL_MAX_PIXELS)
     "capture_format": ("jpeg", "png"),   # encoding sent to the vision model
+    "region": "region",                  # crop x1,y1,x2,y2 in the 1920x1080 frame (the "zoom + pan")
+    "split": "split",                    # x dividing work|personal for the presence guards; 0 = midpoint
 }
+# What the framing editor previews as a draft and saves together.
+FRAMING_KEYS = ("region", "split", "enhance", "upscale", "capture_quality",
+                "capture_format", "capture_frames")
 
 # Tick detection is a PER-ITEM forced choice, not two separate lists. The
 # old "open list + done list" schema let the model transcribe a whole board
@@ -763,14 +796,23 @@ class Syncer:
             "capture_quality": 92,
             "upscale": 1,
             "capture_format": "jpeg",
+            # WB_REGION is only the default; the dashboard's framing editor
+            # overrides it here, and cfg.region follows the live value.
+            "region": list(cfg.region),
+            "split": 0,
         }
+        self.default_region = list(cfg.region)   # WB_REGION, for "reset"
         if self._settings_path.is_file():
             try:
                 saved = json.loads(self._settings_path.read_text())
-                self.settings.update(
+                clean, bad = self.validate_settings(
                     {k: v for k, v in saved.items() if k in self.settings})
+                for key, why in bad.items():
+                    log.warning("settings.json: ignoring %s (%s)", key, why)
+                self.settings.update(clean)
             except (json.JSONDecodeError, OSError) as exc:
                 log.warning("settings.json unreadable (%s), using defaults", exc)
+        cfg.region = tuple(self.settings["region"])
         # Watches, continuously, whether a human is in front of either board.
         # Started by main(); constructed here so it shares the live settings
         # dict (threshold changes from the dashboard apply on the next poll).
@@ -789,17 +831,33 @@ class Syncer:
                 "".join(json.dumps(e) + "\n" for e in self.history))
 
     # -- settings ---------------------------------------------------------
-    def update_settings(self, patch: dict) -> dict:
-        """Validate + apply a runtime settings patch from the dashboard.
-        Returns {'applied': {...}, 'rejected': {key: reason}}."""
-        applied, rejected = {}, {}
+    @staticmethod
+    def validate_settings(patch: dict) -> tuple[dict, dict]:
+        """Type-check and bound a settings patch WITHOUT applying it.
+        Returns ({key: clean value}, {key: reason rejected})."""
+        clean, rejected = {}, {}
         for key, val in patch.items():
             spec = SETTING_BOUNDS.get(key)
             if spec is None:
                 rejected[key] = "unknown setting"
                 continue
             try:
-                if spec is bool:
+                if spec == "region":
+                    if isinstance(val, str):
+                        val = val.split(",")
+                    if not isinstance(val, (list, tuple)) or len(val) != 4:
+                        raise ValueError("want [x1, y1, x2, y2]")
+                    x1, y1, x2, y2 = (int(round(float(v))) for v in val)
+                    if not (0 <= x1 < x2 <= FRAME_W and 0 <= y1 < y2 <= FRAME_H):
+                        raise ValueError(f"must lie inside the {FRAME_W}x{FRAME_H} frame")
+                    if x2 - x1 < MIN_REGION_W or y2 - y1 < MIN_REGION_H:
+                        raise ValueError(f"smaller than {MIN_REGION_W}x{MIN_REGION_H}")
+                    new = [x1, y1, x2, y2]
+                elif spec == "split":
+                    new = int(round(float(val)))
+                    if not 0 <= new <= FRAME_W:
+                        raise ValueError(f"out of range 0..{FRAME_W}")
+                elif spec is bool:
                     if not isinstance(val, bool):
                         raise ValueError("want true/false")
                     new = val
@@ -815,10 +873,23 @@ class Syncer:
             except (TypeError, ValueError) as exc:
                 rejected[key] = str(exc)
                 continue
-            if self.settings[key] != new:
-                applied[key] = new
+            clean[key] = new
+        return clean, rejected
+
+    def update_settings(self, patch: dict) -> dict:
+        """Validate + apply a runtime settings patch from the dashboard.
+        Returns {'applied': {...}, 'rejected': {key: reason}}."""
+        clean, rejected = self.validate_settings(patch)
+        applied = {k: v for k, v in clean.items() if self.settings[k] != v}
         if applied:
             self.settings.update(applied)
+            if "region" in applied:
+                self.cfg.region = tuple(applied["region"])
+                # The change-detection baseline is the OLD framing; diffing a
+                # new one against it is meaningless (and a same-size pan
+                # would not even trip the shape check). Start over: the next
+                # scan reads the board fresh and becomes the new baseline.
+                self._baseline_path.unlink(missing_ok=True)
             write_json_atomic(self._settings_path, self.settings)
             self._record({"type": "settings", "changed": applied})
             log.info("settings changed: %s", json.dumps(applied))
@@ -942,34 +1013,45 @@ class Syncer:
             self._lock.release()
 
     # -- imaging --------------------------------------------------------
-    def _fetch_crop(self, frames: Optional[int] = None) -> tuple[bytes, np.ndarray]:
-        s = self.settings
-        n = frames or s["capture_frames"]
+    def _grab_frame(self, frames: int) -> Image.Image:
+        """One full 1920x1080 photo from kinect-knob, ``frames`` stacked."""
         # Ask kinect-knob for a stacked, losslessly-encoded photo; an older
         # kinect-knob simply ignores unknown params and returns its JPEG.
         params = {"format": "png"}
-        if n > 1:
-            params["frames"] = n
+        if frames > 1:
+            params["frames"] = frames
         r = requests.get(f"{self.cfg.kinect_url}/api/snapshot", params=params,
-                         timeout=15 + 2 * n)
+                         timeout=15 + 2 * frames)
         r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content))
-        crop = img.crop(self.cfg.region).convert("RGB")
+        return Image.open(io.BytesIO(r.content))
+
+    @staticmethod
+    def _prepare(img: Image.Image, region, s: dict) -> tuple[bytes, np.ndarray, Image.Image]:
+        """Frame -> (bytes for the model, raw grey crop, the model's image).
+        Shared by scans and the framing preview, so a preview is exactly
+        what a scan with those settings would send."""
+        crop = img.crop(tuple(region)).convert("RGB")
         # The baseline compares the RAW crop — toggling enhance/upscale must
         # not read as "the board changed".
         gray = np.asarray(crop.convert("L"), dtype=np.float32)
         if s["enhance"]:
             crop = ImageOps.autocontrast(crop, cutoff=1)
             crop = crop.filter(ImageFilter.UnsharpMask(radius=2, percent=80, threshold=2))
-        if s["upscale"] > 1:
-            crop = crop.resize(
-                (crop.width * s["upscale"], crop.height * s["upscale"]), Image.LANCZOS)
+        scale = model_scale(crop.width, crop.height, s["upscale"])
+        if abs(scale - 1.0) > 0.01:
+            crop = crop.resize((round(crop.width * scale), round(crop.height * scale)),
+                               Image.LANCZOS)
         buf = io.BytesIO()
         if s["capture_format"] == "png":
             crop.save(buf, format="PNG")
         else:
             crop.save(buf, format="JPEG", quality=s["capture_quality"])
-        payload = buf.getvalue()
+        return buf.getvalue(), gray, crop
+
+    def _fetch_crop(self, frames: Optional[int] = None) -> tuple[bytes, np.ndarray]:
+        s = self.settings
+        img = self._grab_frame(frames or s["capture_frames"])
+        payload, gray, crop = self._prepare(img, self.cfg.region, s)
         try:
             disp = io.BytesIO()
             crop.save(disp, format="JPEG", quality=90)  # dashboard copy = model's view
@@ -980,6 +1062,54 @@ class Syncer:
         except OSError as exc:
             log.warning("crop save failed: %s", exc)
         return payload, gray
+
+    def live_frame(self, frames: int = 1) -> tuple[bytes, str]:
+        """The whole uncropped camera frame, for the framing editor."""
+        params = {"frames": frames} if frames > 1 else {}
+        r = requests.get(f"{self.cfg.kinect_url}/api/snapshot", params=params,
+                         timeout=15 + 2 * frames)
+        r.raise_for_status()
+        return r.content, r.headers.get("Content-Type", "image/jpeg")
+
+    def framing_preview(self, body: dict) -> tuple[int, dict]:
+        """What the model WOULD see under a draft framing (region, split and
+        image settings layered over the live ones) — and, with read=true,
+        what it reads off it. Touches nothing: no state, no baseline, no
+        dashboard crop, no Todoist. This is how a framing gets judged before
+        it is saved."""
+        draft = {k: v for k, v in body.items() if k in FRAMING_KEYS}
+        clean, rejected = self.validate_settings(draft)
+        if rejected:
+            return 400, {"error": "bad framing", "rejected": rejected}
+        s = {**self.settings, **clean}
+        t0 = time.monotonic()
+        try:
+            img = self._grab_frame(s["capture_frames"])
+        except requests.RequestException as exc:
+            return 502, {"error": f"snapshot failed: {exc}"}
+        payload, gray, crop = self._prepare(img, s["region"], s)
+        mime = "image/png" if s["capture_format"] == "png" else "image/jpeg"
+        x1, y1, x2, y2 = s["region"]
+        out = {
+            "image": f"data:{mime};base64," + base64.standard_b64encode(payload).decode(),
+            "region": s["region"],
+            "split": board_split(tuple(s["region"]), s["split"]),
+            "crop": [x2 - x1, y2 - y1],
+            "model": [crop.width, crop.height],
+            "bytes": len(payload),
+            "luma": round(float(gray.mean())),
+            # upscale asked for more than MODEL_MAX_PIXELS allows
+            "capped": model_scale(x2 - x1, y2 - y1, s["upscale"]) < s["upscale"] - 0.01,
+            "capture_s": round(time.monotonic() - t0, 1),
+        }
+        if body.get("read"):
+            t1 = time.monotonic()
+            try:
+                out["read"] = self.reader.read(payload)
+            except Exception as exc:  # noqa: BLE001 — report it, don't 500
+                out["read_error"] = str(exc)
+            out["read_s"] = round(time.monotonic() - t1, 1)
+        return 200, out
 
     def _diff_score(self, gray: np.ndarray) -> Optional[float]:
         """Mean abs pixel difference vs the last processed read. None means
@@ -1316,7 +1446,7 @@ class Syncer:
         at night on a clear board). Best-effort: [] when the endpoint is
         unavailable (older kinect-knob) or the data is degenerate."""
         x1, y1, x2, y2 = self.cfg.region
-        mid = (x1 + x2) // 2
+        mid = board_split(self.cfg.region, self.settings.get("split", 0))
         blocked = []
         for board, (rx1, rx2) in (("work", (x1, mid)), ("personal", (mid, x2))):
             try:
@@ -1638,6 +1768,10 @@ class Syncer:
             "crop_t": self.crop_t,
             "config": {"model": cfg.model, "interval_s": cfg.interval_s,
                        "region": list(cfg.region),
+                       "default_region": self.default_region,
+                       "split": board_split(cfg.region, self.settings["split"]),
+                       "frame": [FRAME_W, FRAME_H],
+                       "model_max_pixels": MODEL_MAX_PIXELS,
                        "change_threshold": cfg.change_threshold,
                        "missing_to_complete": cfg.missing_to_complete,
                        "todo_entity": cfg.todo_entity,
@@ -1750,6 +1884,47 @@ tr.skip td{color:var(--muted)}
 td .dot{display:inline-block;margin-right:6px}
 footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
 .scroll{overflow-x:auto}
+/* Framing editor. The camera can't zoom or pan, so the box IS the zoom and
+   pan: everything outside it is dimmed, the dashed line is the work|personal
+   divider the presence guards use. All geometry is in % of the frame, so it
+   scales with the card. */
+.stage{position:relative;overflow:hidden;border-radius:8px;border:1px solid var(--border);
+  background:#000;aspect-ratio:16/9;touch-action:none;user-select:none;cursor:crosshair}
+.stage img{display:block;width:100%;height:100%;object-fit:fill;pointer-events:none}
+.stage .loading{position:absolute;inset:0;display:grid;place-items:center;color:#bbb;font-size:13px}
+#fr-box{position:absolute;box-shadow:0 0 0 9999px rgba(0,0,0,.55);outline:2px solid #fab219;
+  cursor:move;touch-action:none}
+#fr-box:focus-visible{outline:3px solid #3987e5}
+#fr-box .h{position:absolute;width:14px;height:14px;background:#fab219;border:2px solid #0b0b0b;
+  border-radius:3px;margin:-7px 0 0 -7px}
+#fr-box .h.nw{left:0;top:0;cursor:nwse-resize} #fr-box .h.n{left:50%;top:0;cursor:ns-resize}
+#fr-box .h.ne{left:100%;top:0;cursor:nesw-resize} #fr-box .h.e{left:100%;top:50%;cursor:ew-resize}
+#fr-box .h.se{left:100%;top:100%;cursor:nwse-resize} #fr-box .h.s{left:50%;top:100%;cursor:ns-resize}
+#fr-box .h.sw{left:0;top:100%;cursor:nesw-resize} #fr-box .h.w{left:0;top:50%;cursor:ew-resize}
+#fr-split{position:absolute;top:0;bottom:0;width:16px;margin-left:-8px;cursor:col-resize}
+#fr-split::after{content:"";position:absolute;left:7px;top:0;bottom:0;border-left:2px dashed #fab219}
+#fr-split.auto::after{opacity:.55}
+#fr-box .tag{position:absolute;top:4px;font-size:11px;color:#0b0b0b;background:#fab219;
+  padding:0 6px;border-radius:4px;pointer-events:none;white-space:nowrap}
+.frbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:10px 0 0}
+.frbar .grp{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--ink2)}
+.frbar button{padding:4px 10px}
+.frbar button.sq{width:30px;padding:4px 0}
+.frbar input[type=number]{width:70px}
+.frbar input[type=range]{width:140px;accent-color:var(--series)}
+.frbar .primary{background:var(--series);color:#fff;border-color:transparent}
+.frbar .primary:disabled{background:var(--surface);color:var(--ink)}
+#fr-info{font-size:12px;color:var(--ink2);margin:8px 0 0;font-variant-numeric:tabular-nums}
+#fr-info .warn{color:var(--serious)}
+#fr-dirty{color:var(--serious)}
+.frout{display:grid;grid-template-columns:3fr 2fr;gap:12px;margin-top:12px}
+@media(max-width:720px){.frout{grid-template-columns:1fr}}
+.frout img{display:block;width:100%;border-radius:8px;border:1px solid var(--border)}
+.frout.stale img{opacity:.45}
+.frout h3{font-size:12px;font-weight:600;color:var(--ink2);margin:0 0 4px}
+.frout ul{list-style:none;margin:0 0 10px;padding:0;font-size:13px}
+.frout li{padding:2px 0;border-top:1px solid var(--grid)}
+.frout li.done{color:var(--muted);text-decoration:line-through}
 </style>
 </head>
 <body>
@@ -1778,6 +1953,45 @@ footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
 
 <section class="card"><h2>Controls <small>changes apply immediately and persist</small></h2>
   <div id="settings" class="setgrid"></div>
+</section>
+
+<section class="card"><h2>Camera framing
+    <span class="hint">drag the box to pan · drag a handle to zoom · drag outside to draw a new box · dashed line = where the work board ends</span>
+    <small id="fr-dirty"></small></h2>
+  <div class="stage" id="fr-stage">
+    <img id="fr-img" alt="Full camera frame" hidden>
+    <div class="loading" id="fr-loading">Loading camera frame&hellip;</div>
+    <div id="fr-box" tabindex="0" aria-label="Crop box: arrow keys pan, + and - zoom">
+      <span class="tag" id="fr-tag-l">work</span><span class="tag" id="fr-tag-r">personal</span>
+      <div id="fr-split" title="Work | personal divider for the presence guard. Double-click to return to the middle."></div>
+      <i class="h nw"></i><i class="h n"></i><i class="h ne"></i><i class="h e"></i>
+      <i class="h se"></i><i class="h s"></i><i class="h sw"></i><i class="h w"></i>
+    </div>
+  </div>
+  <div class="frbar">
+    <span class="grp">Zoom <button class="sq" id="fr-zout" title="Zoom out">&minus;</button>
+      <input type="range" id="fr-zoom" min="1" max="8" step="0.05" aria-label="Zoom">
+      <button class="sq" id="fr-zin" title="Zoom in">+</button></span>
+    <span class="grp">Pan <button class="sq" data-pan="-1,0" title="Left">&larr;</button><button class="sq" data-pan="0,-1" title="Up">&uarr;</button><button class="sq" data-pan="0,1" title="Down">&darr;</button><button class="sq" data-pan="1,0" title="Right">&rarr;</button></span>
+    <span class="grp">x1 <input type="number" id="fr-x1" step="2"> y1 <input type="number" id="fr-y1" step="2">
+      x2 <input type="number" id="fr-x2" step="2"> y2 <input type="number" id="fr-y2" step="2">
+      split <input type="number" id="fr-sp" step="2" title="0 = middle of the box"></span>
+  </div>
+  <div class="setgrid" id="fr-settings" style="margin-top:8px"></div>
+  <div id="fr-info"></div>
+  <div class="frbar">
+    <button id="fr-refresh" title="Take a fresh full-frame photo">Refresh frame</button>
+    <button id="fr-preview" title="Show exactly what the model would be sent">Preview model view</button>
+    <button id="fr-read" title="Preview, then run the model on it. Nothing is saved and Todoist is not touched">Test read</button>
+    <span class="spacer"></span>
+    <button id="fr-reset" title="Back to WB_REGION from .env (not saved until you press Save)">Default</button>
+    <button id="fr-revert" title="Discard unsaved changes">Revert</button>
+    <button id="fr-save" class="primary">Save framing</button>
+  </div>
+  <div class="frout" id="fr-out" hidden>
+    <div><h3 id="fr-out-cap"></h3><img id="fr-out-img" alt="What the model is sent"></div>
+    <div id="fr-out-read"></div>
+  </div>
 </section>
 
 <section class="card"><h2>Latest board photo <small id="crop-cap"></small></h2>
@@ -1880,7 +2094,6 @@ const SETTINGS_UI = [
   ['presence_gate', 'bool', 'Only scan while away'],
   ['change_detection', 'bool', 'Skip unchanged frames'],
   ['obstruction_guard', 'bool', 'Skip when obstructed'],
-  ['enhance', 'bool', 'Enhance photo (contrast+sharpen)'],
   ['due_today', 'bool', 'New tasks due today'],
   ['interval_s', 'num', 'Scan interval (s)', { min: 60, max: 86400, step: 60 }],
   ['change_threshold', 'num', 'Change threshold', { min: 0.1, max: 50, step: 0.5 }],
@@ -1897,10 +2110,15 @@ const SETTINGS_UI = [
   ['presence_required', 'bool', 'Wait when presence is unknown'],
   ['dim_skip', 'bool', 'Skip scan when light is dim'],
   ['dim_luma', 'num', 'Dim threshold (luma 0-255)', { min: 10, max: 150, step: 5 }],
+];
+// Photo + image settings live in the framing card: they are drafted, previewed
+// and saved together with the crop box, not applied one control at a time.
+const FRAMING_UI = [
+  ['enhance', 'bool', 'Enhance photo (contrast+sharpen)'],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
+  ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['1.5', '1.5x'], ['2', '2x'], ['2.5', '2.5x'], ['3', '3x']]],
+  ['capture_format', 'sel', 'Image format to model', [['jpeg', 'JPEG'], ['png', 'PNG (lossless)']]],
   ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
-  ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['2', '2x']]],
-  ['capture_format', 'sel', 'Image format to model', [['jpeg', 'JPEG'], ['png', 'PNG']]],
 ];
 let settingsBuilt = false;
 function buildSettings() {
@@ -1945,6 +2163,265 @@ function syncSettings() {
     else inp.value = String(st.settings[key]);
   }
 }
+// ---- framing editor -------------------------------------------------------
+// fr is the DRAFT: the crop box + image settings being edited. It follows the
+// live settings until the first edit, then holds still until Save or Revert.
+// Coordinates are always full-frame camera pixels (1920x1080).
+const FR_KEYS = ['region', 'split', ...FRAMING_UI.map((f) => f[0])];
+let fr = null, frDirty = false, frGen = 0, frShown = -1;
+const FW = () => st.config.frame[0], FH = () => st.config.frame[1];
+const MIN_W = 160, MIN_H = 120;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const liveFraming = () => Object.fromEntries(FR_KEYS.map((k) =>
+  [k, Array.isArray(st.settings[k]) ? st.settings[k].slice() : st.settings[k]]));
+const sameFraming = (a, b) => JSON.stringify(FR_KEYS.map((k) => a[k])) ===
+  JSON.stringify(FR_KEYS.map((k) => b[k]));
+const splitX = () => { const [x1, , x2] = fr.region;
+  return fr.split > x1 && fr.split < x2 ? fr.split : Math.round((x1 + x2) / 2); };
+
+function frSet(region, split) {
+  // Keep the box inside the frame and at least MIN_W x MIN_H, rounded to even px.
+  let [x1, y1, x2, y2] = region.map((v) => Math.round(v / 2) * 2);
+  x1 = clamp(x1, 0, FW() - MIN_W); y1 = clamp(y1, 0, FH() - MIN_H);
+  x2 = clamp(x2, x1 + MIN_W, FW()); y2 = clamp(y2, y1 + MIN_H, FH());
+  fr.region = [x1, y1, x2, y2];
+  if (split !== undefined) fr.split = split;
+  frChanged();
+}
+function frChanged() {
+  frDirty = !sameFraming(fr, liveFraming());
+  frGen++;
+  frDraw();
+}
+function frScale(w, h) {
+  return Math.min(Number(fr.upscale), Math.sqrt(st.config.model_max_pixels / (w * h)));
+}
+function frDraw() {
+  const [x1, y1, x2, y2] = fr.region, w = x2 - x1, h = y2 - y1;
+  const box = $('fr-box');
+  box.style.left = (x1 / FW() * 100) + '%'; box.style.top = (y1 / FH() * 100) + '%';
+  box.style.width = (w / FW() * 100) + '%'; box.style.height = (h / FH() * 100) + '%';
+  const sx = splitX();
+  $('fr-split').style.left = ((sx - x1) / w * 100) + '%';
+  $('fr-split').classList.toggle('auto', !(fr.split > x1 && fr.split < x2));
+  $('fr-tag-l').style.left = '4px';
+  $('fr-tag-r').style.left = 'calc(' + ((sx - x1) / w * 100) + '% + 6px)';
+  for (const [k, v] of [['x1', x1], ['y1', y1], ['x2', x2], ['y2', y2], ['sp', fr.split]]) {
+    if (document.activeElement !== $('fr-' + k)) $('fr-' + k).value = v;
+  }
+  if (document.activeElement !== $('fr-zoom')) $('fr-zoom').value = (FW() / w).toFixed(2);
+  for (const [key, type] of FRAMING_UI) {
+    const inp = $('fr-set-' + key);
+    if (document.activeElement === inp) continue;
+    if (type === 'bool') inp.checked = !!fr[key]; else inp.value = String(fr[key]);
+  }
+  $('fr-set-capture_quality').disabled = fr.capture_format === 'png';
+  const sc = frScale(w, h), mw = Math.round(w * sc), mh = Math.round(h * sc);
+  const capped = sc < Number(fr.upscale) - 0.01;
+  $('fr-info').innerHTML = '';
+  $('fr-info').append(
+    'Crop ' + w + '×' + h + ' px of ' + FW() + '×' + FH() + ' · zoom ' + (FW() / w).toFixed(2) +
+    '× · model is sent ' + mw + '×' + mh + ' (' + (mw * mh / 1e6).toFixed(2) + ' MP' +
+    (sc > 1.01 ? ', ' + sc.toFixed(2) + '× upscale' : sc < 0.99 ? ', shrunk ' + sc.toFixed(2) + '×' : '') + ')');
+  if (capped) $('fr-info').append(el('span', 'warn', ' · upscale capped at ' +
+    (st.config.model_max_pixels / 1e6).toFixed(1) + ' MP so the image fits the model context'));
+  $('fr-dirty').textContent = frDirty ? 'unsaved changes' : 'saved';
+  $('fr-save').disabled = !frDirty; $('fr-revert').disabled = !frDirty;
+  $('fr-out').classList.toggle('stale', frShown !== frGen);
+}
+
+function frZoom(factor) {
+  // Zoom about the box centre, keeping its aspect ratio.
+  const [x1, y1, x2, y2] = fr.region, cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+  let w = clamp((x2 - x1) / factor, MIN_W, FW()), h = (y2 - y1) * w / (x2 - x1);
+  if (h > FH()) { w *= FH() / h; h = FH(); }
+  if (h < MIN_H) { w *= MIN_H / h; h = MIN_H; }
+  let nx = clamp(cx - w / 2, 0, FW() - w), ny = clamp(cy - h / 2, 0, FH() - h);
+  frSet([nx, ny, nx + w, ny + h]);
+}
+function frPan(dx, dy) {
+  const [x1, y1, x2, y2] = fr.region, w = x2 - x1, h = y2 - y1;
+  const nx = clamp(x1 + dx, 0, FW() - w), ny = clamp(y1 + dy, 0, FH() - h);
+  const sx = fr.split > x1 && fr.split < x2 ? fr.split + (nx - x1) : fr.split;
+  frSet([nx, ny, nx + w, ny + h], sx);
+}
+
+// Pointer editing: drag the box = pan, a handle = resize that edge/corner,
+// the dashed line = move the divider, empty frame = draw a fresh box.
+let drag = null;
+function frPoint(e) {
+  const r = $('fr-stage').getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width * FW(), (e.clientY - r.top) / r.height * FH()];
+}
+function frDown(e) {
+  if (!fr || e.button > 0) return;
+  const t = e.target, p = frPoint(e);
+  let mode = 'draw';
+  if (t.id === 'fr-split') mode = 'split';
+  else if (t.classList.contains('h')) mode = [...t.classList].find((c) => c !== 'h');
+  else if (t.closest('#fr-box')) mode = 'move';
+  drag = { mode, p0: p, r0: fr.region.slice(), s0: fr.split };
+  $('fr-stage').setPointerCapture(e.pointerId);
+  e.preventDefault();
+}
+function frMove(e) {
+  if (!drag) return;
+  const [px, py] = frPoint(e), dx = px - drag.p0[0], dy = py - drag.p0[1];
+  let [x1, y1, x2, y2] = drag.r0;
+  const m = drag.mode;
+  if (m === 'move') {
+    const w = x2 - x1, h = y2 - y1;
+    const nx = clamp(x1 + dx, 0, FW() - w), ny = clamp(y1 + dy, 0, FH() - h);
+    const s0 = drag.s0, keep = s0 > x1 && s0 < x2;
+    frSet([nx, ny, nx + w, ny + h], keep ? s0 + (nx - x1) : s0);
+    return;
+  }
+  if (m === 'split') { frSet(fr.region, Math.round(clamp(px, x1 + 20, x2 - 20) / 2) * 2); return; }
+  if (m === 'draw') {
+    const [ax, ay] = drag.p0;
+    if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;   // a click, not a drag
+    x1 = Math.min(ax, px); x2 = Math.max(ax, px); y1 = Math.min(ay, py); y2 = Math.max(ay, py);
+    frSet([clamp(x1, 0, FW()), clamp(y1, 0, FH()), clamp(x2, 0, FW()), clamp(y2, 0, FH())], 0);
+    return;
+  }
+  if (m.includes('w')) x1 = clamp(x1 + dx, 0, x2 - MIN_W);
+  if (m.includes('e')) x2 = clamp(x2 + dx, x1 + MIN_W, FW());
+  if (m.includes('n')) y1 = clamp(y1 + dy, 0, y2 - MIN_H);
+  if (m.includes('s')) y2 = clamp(y2 + dy, y1 + MIN_H, FH());
+  frSet([x1, y1, x2, y2]);
+}
+function frUp() { drag = null; }
+
+function frLoadFrame() {
+  const img = $('fr-img');
+  $('fr-loading').hidden = false; $('fr-loading').textContent = 'Loading camera frame…';
+  img.onload = () => { img.hidden = false; $('fr-loading').hidden = true; };
+  img.onerror = () => { $('fr-loading').hidden = false;
+    $('fr-loading').textContent = 'Camera frame unavailable — is kinect-knob running? Try Refresh frame.'; };
+  img.src = '/api/frame?t=' + Date.now();
+}
+
+async function frPreview(read) {
+  const btns = ['fr-preview', 'fr-read'].map($);
+  btns.forEach((b) => { b.disabled = true; });
+  const gen = frGen, label = read ? $('fr-read') : $('fr-preview'), old = label.textContent;
+  label.textContent = read ? 'Reading… (can take 30 s)' : 'Capturing…';
+  try {
+    const r = await fetch('/api/framing/preview', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...Object.fromEntries(FR_KEYS.map((k) => [k, fr[k]])), read }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error + (j.rejected ? ': ' + JSON.stringify(j.rejected) : ''));
+    $('fr-out').hidden = false;
+    $('fr-out-img').src = j.image;
+    $('fr-out-cap').textContent = 'Model view ' + j.model[0] + '×' + j.model[1] + ' · ' +
+      Math.round(j.bytes / 1024) + ' KB · luma ' + j.luma +
+      (j.luma < st.settings.dim_luma ? ' (dim — scheduled scans would skip)' : '') +
+      ' · ' + j.capture_s + ' s to capture';
+    const out = $('fr-out-read'); out.innerHTML = '';
+    if (read) frRenderRead(out, j); else
+      out.append(el('div', 'empty', 'Test read runs the vision model on this exact image — nothing is saved and Todoist is not touched.'));
+    frShown = gen; frDraw();
+  } catch (e) { $('note').textContent = 'Framing preview failed: ' + e.message; }
+  finally { label.textContent = old; btns.forEach((b) => { b.disabled = false; }); }
+}
+function frRenderRead(out, j) {
+  if (j.read_error) { out.append(el('div', 'empty', 'Read failed after ' + j.read_s + ' s: ' + j.read_error)); return; }
+  const rd = j.read;
+  out.append(el('h3', null, 'Model read in ' + j.read_s + ' s'));
+  for (const [board, name] of [['work', 'Work (left)'], ['personal', 'Personal (right)']]) {
+    const done = new Set(rd[board + '_done'] || []), order = rd[board + '_order'] || [];
+    out.append(el('h3', null, name + ' · ' + order.length + ' items' +
+      (rd[board + '_obstructed'] ? ' · model says OBSTRUCTED' : '')));
+    const ul = el('ul');
+    if (!order.length) ul.append(el('li', 'done', 'nothing read'));
+    for (const t of order) ul.append(el('li', done.has(t) ? 'done' : null, (done.has(t) ? '☑ ' : '☐ ') + t));
+    out.append(ul);
+  }
+}
+
+async function frSave() {
+  $('fr-save').disabled = true;
+  try {
+    const r = await fetch('/api/settings', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.fromEntries(FR_KEYS.map((k) => [k, fr[k]]))) });
+    const j = await r.json();
+    const rej = Object.entries(j.rejected || {});
+    if (rej.length) { $('note').textContent = 'Not saved: ' + rej.map(([k, v]) => k + ' ' + v).join('; '); return; }
+    $('note').textContent = 'Framing saved — the next scan reads the boards fresh with it' +
+      (j.applied && j.applied.region ? '. If presence starts misbehaving, press Relearn empty boards.' : '.');
+    await refresh();
+    fr = liveFraming(); frDirty = false;   // same framing: a preview of it is still current
+  } catch (e) { $('note').textContent = 'Save failed: ' + e; }
+  finally { frDraw(); }
+}
+
+function frBuild() {
+  const host = $('fr-settings');
+  for (const [key, type, label, opt] of FRAMING_UI) {
+    const row = el('div', 'setrow');
+    const lab = el('label', null, label); lab.htmlFor = 'fr-set-' + key;
+    row.appendChild(lab);
+    let inp;
+    if (type === 'bool') { inp = el('input'); inp.type = 'checkbox'; }
+    else if (type === 'num') { inp = el('input'); inp.type = 'number';
+      inp.min = opt.min; inp.max = opt.max; inp.step = opt.step; }
+    else { inp = el('select');
+      for (const [v, l] of opt) { const o = el('option', null, l); o.value = v; inp.appendChild(o); } }
+    inp.id = 'fr-set-' + key;
+    inp.addEventListener('change', () => {
+      if (type === 'bool') fr[key] = inp.checked;
+      else if (type === 'num') fr[key] = clamp(Number(inp.value) || opt.min, opt.min, opt.max);
+      else fr[key] = key === 'upscale' ? Number(inp.value) : inp.value;
+      frChanged();
+    });
+    row.appendChild(inp); host.appendChild(row);
+  }
+  const stage = $('fr-stage');
+  stage.addEventListener('pointerdown', frDown);
+  stage.addEventListener('pointermove', frMove);
+  stage.addEventListener('pointerup', frUp);
+  stage.addEventListener('pointercancel', frUp);
+  $('fr-split').addEventListener('dblclick', () => frSet(fr.region, 0));
+  $('fr-box').addEventListener('keydown', (e) => {
+    const step = e.shiftKey ? 40 : 4;
+    const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+    if (moves[e.key]) { frPan(...moves[e.key]); e.preventDefault(); }
+    else if (e.key === '+' || e.key === '=') { frZoom(1.05); e.preventDefault(); }
+    else if (e.key === '-') { frZoom(1 / 1.05); e.preventDefault(); }
+  });
+  $('fr-zin').onclick = () => frZoom(1.1);
+  $('fr-zout').onclick = () => frZoom(1 / 1.1);
+  $('fr-zoom').addEventListener('input', () => {
+    const w = fr.region[2] - fr.region[0];
+    frZoom(Number($('fr-zoom').value) / (FW() / w));
+  });
+  for (const b of document.querySelectorAll('[data-pan]')) {
+    b.onclick = (e) => { const [dx, dy] = b.dataset.pan.split(',').map(Number);
+      const step = e.shiftKey ? 80 : 16; frPan(dx * step, dy * step); };
+  }
+  for (const k of ['x1', 'y1', 'x2', 'y2']) {
+    $('fr-' + k).addEventListener('change', () => {
+      const r = ['x1', 'y1', 'x2', 'y2'].map((n) => Number($('fr-' + n).value) || 0);
+      frSet(r);
+    });
+  }
+  $('fr-sp').addEventListener('change', () => frSet(fr.region, Math.max(0, Number($('fr-sp').value) || 0)));
+  $('fr-refresh').onclick = frLoadFrame;
+  $('fr-preview').onclick = () => frPreview(false);
+  $('fr-read').onclick = () => frPreview(true);
+  $('fr-save').onclick = frSave;
+  $('fr-revert').onclick = () => { fr = liveFraming(); frChanged(); };
+  $('fr-reset').onclick = () => frSet(st.config.default_region.slice(), 0);
+  frLoadFrame();
+}
+function frSync() {
+  if (!fr) { fr = liveFraming(); frBuild(); }
+  else if (!frDirty && !drag && !sameFraming(fr, liveFraming())) fr = liveFraming();
+  frDraw();
+}
+
 const KINDCOLOR = { good: 'var(--good)', warn: 'var(--warn)', crit: 'var(--crit)', muted: 'var(--muted)' };
 
 function pill(cls, text) { const p = $('pill'); p.className = 'pill ' + cls; $('pilltext').textContent = text; }
@@ -1999,7 +2476,7 @@ function render() {
     $('crop-cap').textContent = 'captured ' + ago(st.crop_t);
   }
 
-  syncSettings(); chart(); table();
+  syncSettings(); frSync(); chart(); table();
 
   const c = st.counters, cfg = st.config, set = st.settings;
   $('counters').textContent = 'since start: ' + c.scans + ' scans · ' + c.changed +
@@ -2403,6 +2880,17 @@ def serve_http(syncer: Syncer) -> None:
                     self._bytes(200, syncer.crop_path.read_bytes(), "image/jpeg")
                 except OSError:
                     self._json(404, {"error": "no crop captured yet"})
+            elif path == "/api/frame":
+                # Full uncropped frame for the framing editor.
+                q = parse_qs(urlparse(self.path).query)
+                try:
+                    frames = max(1, min(LOWLIGHT_FRAMES, int((q.get("frames") or ["1"])[0])))
+                    body, ctype = syncer.live_frame(frames)
+                    self._bytes(200, body, ctype)
+                except ValueError:
+                    self._json(400, {"error": "frames must be an integer"})
+                except requests.RequestException as exc:
+                    self._json(502, {"error": f"snapshot failed: {exc}"})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -2426,6 +2914,17 @@ def serve_http(syncer: Syncer) -> None:
                     self._json(400, {"error": f"bad body: {exc}"})
                     return
                 self._json(200, syncer.update_settings(patch))
+            elif url.path == "/api/framing/preview":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(body, dict):
+                        raise ValueError("want a JSON object")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    self._json(400, {"error": f"bad body: {exc}"})
+                    return
+                code, resp = syncer.framing_preview(body)
+                self._json(code, resp)
             elif url.path == "/api/presence/relearn":
                 # Ask kinect-knob to forget the learned empty-board plane.
                 # Needed after the camera or the boards move — and the escape

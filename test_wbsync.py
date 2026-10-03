@@ -1543,3 +1543,110 @@ def test_a_freshly_started_watcher_has_not_earned_a_settle_window(monkeypatch):
     w.started_t -= 600
     assert w.clear_for_s("work") > 595
     assert w.blocked_boards(min_clear_s=60) == []
+
+
+# ---------------------------------------------------------------- framing
+# The camera can't zoom or pan; the crop region is the zoom and pan, and the
+# dashboard's framing editor changes it at runtime.
+
+from wbsync import MODEL_MAX_PIXELS, board_split, model_scale  # noqa: E402
+
+
+def frame_png(w=1920, h=1080, shade=200):
+    import io as _io
+    from PIL import Image
+    buf = _io.BytesIO()
+    Image.new("RGB", (w, h), (shade, shade, shade)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_region_is_validated_against_the_frame(tmp_path):
+    s = make_syncer(tmp_path)
+    ok, bad = s.validate_settings({"region": [600, 380, 1280, 930]})
+    assert ok == {"region": [600, 380, 1280, 930]} and not bad
+    assert s.validate_settings({"region": "600,380,1280,930"})[0]["region"] == [600, 380, 1280, 930]
+    for nonsense in ([0, 0, 2000, 500], [500, 500, 400, 900], [0, 0, 50, 50],
+                     [1, 2, 3], "a,b,c,d", None):
+        assert "region" in s.validate_settings({"region": nonsense})[1], nonsense
+
+
+def test_saving_a_region_moves_the_live_crop_and_drops_the_baseline(tmp_path):
+    """Diffing a new framing against the old baseline is meaningless — a
+    same-size pan would not even trip the shape check."""
+    import numpy as np
+    s = make_syncer(tmp_path)
+    np.save(s._baseline_path, np.zeros((5, 5), dtype=np.float32))
+    out = s.update_settings({"region": [600, 380, 1280, 930], "split": 940})
+    assert out["applied"] == {"region": [600, 380, 1280, 930], "split": 940}
+    assert s.cfg.region == (600, 380, 1280, 930)
+    assert not s._baseline_path.exists()
+    # unrelated settings leave the baseline alone
+    np.save(s._baseline_path, np.zeros((5, 5), dtype=np.float32))
+    s.update_settings({"interval_s": 600})
+    assert s._baseline_path.exists()
+
+
+def test_saved_region_survives_a_restart_and_env_stays_the_default(tmp_path):
+    s = make_syncer(tmp_path)
+    s.update_settings({"region": [600, 380, 1280, 930]})
+    s2 = make_syncer(tmp_path)
+    assert s2.cfg.region == (600, 380, 1280, 930)
+    assert s2.default_region == [0, 0, 10, 10]   # what WB_REGION said
+
+
+def test_a_corrupt_saved_region_falls_back_to_the_default(tmp_path):
+    (tmp_path / "settings.json").write_text(json.dumps({"region": [5, 5, 1, 1],
+                                                        "interval_s": 600}))
+    s = make_syncer(tmp_path)
+    assert s.cfg.region == (0, 0, 10, 10)
+    assert s.settings["interval_s"] == 600
+
+
+def test_board_split_defaults_to_the_midpoint():
+    assert board_split((600, 280, 1320, 810)) == 960
+    assert board_split((600, 280, 1320, 810), 940) == 940
+    assert board_split((600, 280, 1320, 810), 1500) == 960   # outside the box
+
+
+def test_watcher_divides_the_boards_at_the_saved_split(monkeypatch):
+    w = make_watcher(monkeypatch, FakePresenceAPI(),
+                     settings={"presence_occupancy": 0.015, "split": 940})
+    regions = w.regions()
+    assert regions["work"][2] == 940 + 120
+    assert regions["personal"][0] == 940 - 120
+
+
+def test_upscale_is_capped_to_what_the_model_context_holds():
+    assert model_scale(720, 530, 2) == 2                       # today's default fits
+    big = model_scale(680, 540, 3)
+    assert big < 3 and 680 * 540 * big * big <= MODEL_MAX_PIXELS * 1.0001
+    assert model_scale(1920, 1080, 1) < 1                      # whole frame shrinks
+
+
+def test_framing_preview_renders_the_draft_and_touches_nothing(tmp_path, monkeypatch):
+    s = make_syncer(tmp_path)
+    s.reader = FixedReader({"work": ["a"], "work_done": [], "work_order": ["a"],
+                            "personal": [], "personal_done": [], "personal_order": [],
+                            "work_obstructed": False, "personal_obstructed": False})
+
+    class R:
+        content = frame_png()
+        def raise_for_status(self):
+            pass
+    monkeypatch.setattr("wbsync.requests.get", lambda *a, **k: R())
+    before = json.dumps(s.settings)
+    code, out = s.framing_preview({"region": [600, 380, 1280, 930], "upscale": 2,
+                                   "capture_format": "jpeg", "read": True})
+    assert code == 200
+    assert out["crop"] == [680, 550] and out["model"] == [1360, 1100]
+    assert out["image"].startswith("data:image/jpeg;base64,")
+    assert out["read"]["work"] == ["a"]
+    assert json.dumps(s.settings) == before                    # draft, not saved
+    assert s.cfg.region == (0, 0, 10, 10)
+    assert not s.crop_path.exists() and not s._baseline_path.exists()
+
+
+def test_framing_preview_rejects_a_bad_draft(tmp_path):
+    s = make_syncer(tmp_path)
+    code, out = s.framing_preview({"region": [0, 0, 5000, 10]})
+    assert code == 400 and "region" in out["rejected"]
