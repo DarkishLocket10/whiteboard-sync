@@ -118,6 +118,9 @@ PRESENCE_MARGIN_PX = 120     # widen the asked-about region by this much: a
                              # inside it, and its shadow/arm already is
 PRESENCE_POLL_S = 3.0        # background poll cadence (one cheap HTTP call)
 PRESENCE_STALE_S = 30.0      # readings older than this tell us nothing
+# kinect-knob switches its camera off overnight (KK_OFF_WINDOW) and answers
+# 503 {"camera": "off"} meanwhile: poll that slowly, and don't scan at all.
+PRESENCE_OFF_POLL_S = 60.0
 
 # Framing. The Kinect v2 colour camera has no optical zoom, pan or exposure
 # control the service can use, so "zoom" and "pan" are the crop rectangle cut
@@ -148,6 +151,26 @@ def model_scale(w: int, h: int, upscale: float) -> float:
     return min(float(upscale), (MODEL_MAX_PIXELS / max(1, w * h)) ** 0.5)
 
 
+class CameraOff(requests.RequestException):
+    """kinect-knob is up but its camera is deliberately off (the scheduled
+    night window). A RequestException so every existing "snapshot failed"
+    handler still catches it; scans and the scheduler single it out to stay
+    quiet instead of logging an error every interval all night."""
+
+
+def camera_off_detail(r) -> Optional[str]:
+    """The 'scheduled off' detail if ``r`` is kinect-knob's camera-off 503."""
+    if getattr(r, "status_code", 200) != 503:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    if isinstance(data, dict) and data.get("camera") == "off":
+        return str(data.get("detail") or "camera off")
+    return None
+
+
 class PresenceWatcher(threading.Thread):
     """Watches, continuously, whether a human is in front of either board.
 
@@ -176,6 +199,7 @@ class PresenceWatcher(threading.Thread):
         # board -> {"occupancy", "blocked", "t", "last_blocked_t", "plane_mm"}
         self.boards: dict[str, dict] = {}
         self.scene: dict = {}                   # whole-room presence, if offered
+        self.camera_off: Optional[str] = None   # kinect-knob's "off until" detail
 
     # -- geometry -------------------------------------------------------
     def regions(self) -> dict[str, tuple[int, int, int, int]]:
@@ -190,7 +214,8 @@ class PresenceWatcher(threading.Thread):
 
     # -- polling --------------------------------------------------------
     def run(self) -> None:
-        while not self._stop.wait(PRESENCE_POLL_S):
+        while not self._stop.wait(PRESENCE_OFF_POLL_S if self.camera_off
+                                  else PRESENCE_POLL_S):
             try:
                 self.poll()
             except Exception:  # noqa: BLE001 — a watcher must never die
@@ -211,6 +236,16 @@ class PresenceWatcher(threading.Thread):
                 r = requests.get(f"{self.cfg.kinect_url}/api/presence",
                                  params={"x1": rx1, "y1": ry1, "x2": rx2, "y2": ry2},
                                  timeout=5)
+                off = camera_off_detail(r)
+                if off is not None:
+                    with self._lock:
+                        if not self.camera_off:
+                            log.info("kinect-knob camera is off (%s) — "
+                                     "presence polling slowed", off)
+                        self.camera_off = off
+                        self.error = "camera off"
+                        self.boards = {}
+                    return
                 if r.status_code == 404:
                     # Either an older kinect-knob with no /api/presence, or a
                     # backend with no depth. Either way: fall back.
@@ -223,6 +258,10 @@ class PresenceWatcher(threading.Thread):
             except (requests.RequestException, ValueError) as exc:
                 with self._lock:
                     self.error = str(exc)
+                    # Drop the readings now rather than letting them age out:
+                    # a camera that is restarting has no opinion on who is
+                    # at the boards, and "unknown" is the honest answer.
+                    self.boards = {}
                 return
             region = data.get("region") or {}
             occ = float(region.get("occupancy", 0.0))
@@ -241,8 +280,13 @@ class PresenceWatcher(threading.Thread):
                      "since_seen_s": data.get("since_seen_s"),
                      "available": bool(data.get("available"))}
         with self._lock:
+            if self.error is not None or self.camera_off or not self.boards:
+                # Back from an outage (or the first answer): the settle window
+                # restarts — time nobody was watching is not time "clear".
+                self.started_t = now
             self.supported = True
             self.error = None
+            self.camera_off = None
             self.boards = fresh
             self.scene = scene
 
@@ -313,6 +357,7 @@ class PresenceWatcher(threading.Thread):
         with self._lock:
             boards = {b: dict(r) for b, r in self.boards.items()}
             out = {"supported": self.supported, "error": self.error,
+                   "camera_off": self.camera_off,
                    "scene": dict(self.scene)}
         now = time.time()
         for board, rec in boards.items():
@@ -542,6 +587,19 @@ class HomeAssistant:
             log.warning("HA %s.%s failed: %s", domain, service, exc)
             return False
 
+    def open_items(self, entity: str) -> Optional[list[str]]:
+        """Summaries of the to-do list's OPEN items, or None if HA can't say."""
+        try:
+            r = self._s.post(f"{self._url}/api/services/todo/get_items?return_response",
+                             json={"entity_id": entity, "status": ["needs_action"]},
+                             timeout=15)
+            r.raise_for_status()
+            items = r.json()["service_response"][entity]["items"]
+            return [i["summary"] for i in items]
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            log.warning("HA todo.get_items failed: %s", exc)
+            return None
+
 
 class BoardReader:
     """Local Ollama vision call: JPEG in, {'work': [...], 'personal': [...]} out.
@@ -759,10 +817,11 @@ class Syncer:
         self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         self.loop_beat = time.time()
         self.gate: dict = {}  # last presence-gate skip, for the dashboard
+        self._camera_off_noted = False   # night-window skip recorded once
         self.counters = {"scans": 0, "changed": 0, "unchanged": 0, "obstructed": 0,
                          "errors": 0, "added": 0, "completed": 0, "skips_home": 0,
                          "skips_off": 0, "skips_person": 0, "skips_dim": 0,
-                         "skips_person_late": 0}
+                         "skips_person_late": 0, "skips_camera_off": 0}
         self._presence: Optional[str] = None
         self._presence_t = 0.0
         # Did the last _depth_obstructed() call actually reach the endpoint?
@@ -1022,8 +1081,18 @@ class Syncer:
             params["frames"] = frames
         r = requests.get(f"{self.cfg.kinect_url}/api/snapshot", params=params,
                          timeout=15 + 2 * frames)
+        off = camera_off_detail(r)
+        if off is not None:
+            raise CameraOff(off)
         r.raise_for_status()
-        return Image.open(io.BytesIO(r.content))
+        ctype = getattr(r, "headers", {}).get("Content-Type", "image/")
+        if not ctype.startswith("image/"):
+            raise requests.RequestException(
+                f"snapshot returned {ctype}, not an image")
+        try:
+            return Image.open(io.BytesIO(r.content))
+        except OSError as exc:  # truncated / corrupt image
+            raise requests.RequestException(f"unreadable snapshot: {exc}") from exc
 
     @staticmethod
     def _prepare(img: Image.Image, region, s: dict) -> tuple[bytes, np.ndarray, Image.Image]:
@@ -1068,6 +1137,9 @@ class Syncer:
         params = {"frames": frames} if frames > 1 else {}
         r = requests.get(f"{self.cfg.kinect_url}/api/snapshot", params=params,
                          timeout=15 + 2 * frames)
+        off = camera_off_detail(r)
+        if off is not None:
+            raise CameraOff(off)
         r.raise_for_status()
         return r.content, r.headers.get("Content-Type", "image/jpeg")
 
@@ -1139,12 +1211,28 @@ class Syncer:
             task["due_date_string"] = "today"
         return self.ha.call("todoist", "new_task", task)
 
-    def _complete_in_todoist(self, item: dict) -> bool:
-        return self.ha.call("todo", "update_item", {
-            "entity_id": self.cfg.todo_entity,
-            "item": item["text"],
-            "status": "completed",
-        })
+    def _complete_in_todoist(self, item: dict) -> str:
+        """"ok" | "orphaned" | "failed".
+
+        "orphaned": the call failed and the task is not open in Todoist at all
+        — completed, renamed or deleted there directly. Retrying can never
+        succeed, so the caller settles the item locally. Before this existed
+        three such items failed on EVERY scan for a week (2026-10): each
+        failure also blocked the change-detection baseline (so every scan was
+        "changed") and kept a tick-confirm photo + second model read firing."""
+        if self.ha.call("todo", "update_item", {
+                "entity_id": self.cfg.todo_entity,
+                "item": item["text"],
+                "status": "completed"}):
+            return "ok"
+        lookup = getattr(self.ha, "open_items", None)
+        open_now = lookup(self.cfg.todo_entity) if lookup else None
+        if open_now is not None and item["text"] not in open_now:
+            log.warning("[%s] %r has no open Todoist task (completed or "
+                        "deleted there) — settling it locally", item["board"],
+                        item["text"])
+            return "orphaned"
+        return "failed"
 
     def reconcile(self, seen: dict, apply: bool = True,
                   tick_start_ok: bool = True,
@@ -1212,6 +1300,7 @@ class Syncer:
         need_seen = self.settings["sightings_to_add"]
         base_miss = self.settings["missing_to_complete"]
         added, completed, pending, slowed, failed = [], [], [], [], 0
+        parked, orphaned = [], []
         for board in ("work", "personal"):
             seen_open = [t.strip() for t in seen.get(board, []) if t.strip()]
             seen_done = [t.strip() for t in seen.get(f"{board}_done", []) if t.strip()]
@@ -1290,11 +1379,25 @@ class Syncer:
                     # but remember it so a misread of its tick can't create
                     # one later. Never from a protected board: a false
                     # "marked" there would park a real new item as done and
-                    # its task would never be created.
-                    self.state["items"].append({"text": text, "board": board,
-                                                "status": "done", "missing": 0,
-                                                "ticked": 0,
-                                                "pos": order_idx.get(text, len(order_idx))})
+                    # its task would never be created. And never off ONE read
+                    # when ticks need a streak: it starts as a pending item
+                    # one tick in, and parks only if the tick holds (see the
+                    # pending branch below); read open instead, it becomes a
+                    # normal task.
+                    pos = order_idx.get(text, len(order_idx))
+                    if self.settings["ticked_to_complete"] <= 1 and tick_start_ok:
+                        self.state["items"].append({"text": text, "board": board,
+                                                    "status": "done", "missing": 0,
+                                                    "ticked": 0, "pos": pos})
+                        parked.append(text)
+                        log.info("parked [%s] %r as done: first seen ticked",
+                                 board, text)
+                    else:
+                        self.state["items"].append({"text": text, "board": board,
+                                                    "status": "pending", "missing": 0,
+                                                    "ticked": 1 if tick_start_ok else 0,
+                                                    "seen": 1, "pos": pos})
+                        pending.append(text)
                     known_texts.append(text)
             if apply:
                 for item in known:
@@ -1327,21 +1430,43 @@ class Syncer:
                     # CONSECUTIVE: one miss on a clear board kills the item
                     # — that strictness is the whole anti-hallucination
                     # point, and a real item just starts accruing again.
-                    # A static-scene tick is a misread here too — it would
-                    # park the item as done and its task would never exist.
-                    pending_tick = ticked and tick_start_ok
+                    #
+                    # A trusted tick here is a STREAK, exactly as on an open
+                    # item: ``ticked_to_complete`` consecutive ticks (plus the
+                    # tick-confirm photo) park it as done without a task —
+                    # finished before we ever believed in it. Until 2026-10
+                    # ONE tick read parked it on the spot, silently: a single
+                    # misread box made a real new item vanish with no task and
+                    # no trace ("Review UK Retreat Photos"). A static-scene
+                    # tick cannot START a streak (see tick_start_ok).
+                    need_tick = self.settings["ticked_to_complete"]
+                    streak = item.get("ticked", 0)
+                    tick_counts = ticked and (tick_start_ok or streak > 0)
                     if not apply:
-                        if not pending_tick and sighted and item["seen"] + 1 >= need_seen:
+                        if tick_counts and streak + 1 >= need_tick:
+                            parked.append(item["text"])
+                        elif sighted and not tick_counts and item["seen"] + 1 >= need_seen:
                             added.append(item["text"])
                         elif sighted:
                             pending.append(item["text"])
                         continue
-                    if pending_tick:
-                        # Finished before we ever believed in it — never a task.
-                        item.pop("seen", None)
-                        item["status"] = "done"
+                    if tick_counts:
+                        item["ticked"] = streak + 1
                         item["missing"] = 0
+                        if item["ticked"] >= need_tick:
+                            item.pop("seen", None)
+                            item["status"] = "done"
+                            item["ticked"] = 0
+                            parked.append(item["text"])
+                            log.info("parked [%s] %r as done without a task: "
+                                     "ticked on %d consecutive reads before it "
+                                     "was ever confirmed", board, item["text"],
+                                     need_tick)
+                        else:
+                            pending.append(item["text"])
                     elif sighted:
+                        if board not in protected and not ticked:
+                            item["ticked"] = 0   # read open: the streak was a misread
                         item["seen"] += 1
                         if item["seen"] >= need_seen:
                             if self._push_task(item["text"], board):
@@ -1384,12 +1509,13 @@ class Syncer:
                     item["missing"] = 0
                     item["ticked"] += 1
                     if item["ticked"] >= self.settings["ticked_to_complete"]:
-                        if self._complete_in_todoist(item):
+                        outcome = self._complete_in_todoist(item)
+                        if outcome == "failed":
+                            failed += 1
+                        else:
                             item["status"] = "done"
                             item["ticked"] = 0
-                            completed.append(item["text"])
-                        else:
-                            failed += 1
+                            (completed if outcome == "ok" else orphaned).append(item["text"])
                     continue
                 if sighted:
                     if apply:
@@ -1411,15 +1537,21 @@ class Syncer:
                 item["missing"] += 1
                 item["ticked"] = 0
                 if item["missing"] >= miss_needed:
-                    if self._complete_in_todoist(item):
-                        self.state["items"].remove(item)
-                        completed.append(item["text"])
-                    else:
+                    outcome = self._complete_in_todoist(item)
+                    if outcome == "failed":
                         failed += 1
+                    else:
+                        self.state["items"].remove(item)
+                        (completed if outcome == "ok" else orphaned).append(item["text"])
         if apply:
             self._save_items()
-        return {"added": added, "completed": completed, "pending": pending,
-                "failed": failed, "protected": protected, "slowed": slowed}
+        out = {"added": added, "completed": completed, "pending": pending,
+               "failed": failed, "protected": protected, "slowed": slowed}
+        if parked:
+            out["parked"] = parked
+        if orphaned:
+            out["orphaned"] = orphaned
+        return out
 
     # -- scan -------------------------------------------------------------
     def scan(self, force: bool = False, dry: bool = False, trigger: str = "manual") -> dict:
@@ -1486,8 +1618,13 @@ class Syncer:
             except Exception:  # noqa: BLE001
                 log.debug("initial presence poll failed", exc_info=True)
         if self.watcher.supported:
-            return (self.watcher.blocked_boards(self.settings["presence_clear_s"]),
-                    "presence")
+            blocked = self.watcher.blocked_boards(self.settings["presence_clear_s"])
+            if blocked:
+                return blocked, "presence"
+            if all(self.watcher.status(b) == "clear" for b in ("work", "personal")):
+                return [], "presence"
+            # A board with no fresh reading (camera restarting, endpoint
+            # erroring) is NOT clear; fall through to the weaker evidence.
         # No occupancy signal (older kinect-knob, no depth backend, endpoint
         # unreachable): the percentile guard is weaker but far better than
         # nothing — it still catches a whole body at a board.
@@ -1508,11 +1645,29 @@ class Syncer:
             if not done:
                 continue
             for item in self.state["items"]:
-                if (item["board"] == board and item["status"] == "open"
-                        and item["ticked"] + 1 >= need
+                if (item["board"] == board and item["status"] in ("open", "pending")
+                        and item.get("ticked", 0) + 1 >= need
                         and fuzzy_match(item["text"], done)):
                     return True
         return False
+
+    def _wipe_imminent(self, seen: dict, force_protect: tuple = ()) -> list[str]:
+        """Boards this read shows EMPTY while absence would complete
+        ``MASS_ERASE_MIN``+ tracked tasks. A real wipe reads empty and
+        completes at the normal threshold (by design); the second photo only
+        rules out the read itself being the empty thing — a truncated model
+        reply or a frame from a camera that was coming back up."""
+        out = []
+        base_miss = self.settings["missing_to_complete"]
+        for board in ("work", "personal"):
+            if board in force_protect or seen.get(board) or seen.get(f"{board}_done"):
+                continue
+            doomed = [i for i in self.state["items"]
+                      if i["board"] == board and i["status"] == "open"
+                      and i["missing"] + 1 >= base_miss]
+            if len(doomed) >= MASS_ERASE_MIN:
+                out.append(board)
+        return out
 
     def _scan_inner(self, force: bool, dry: bool) -> dict:
         s = self.settings
@@ -1536,6 +1691,9 @@ class Syncer:
         capture_t0 = time.time()
         try:
             jpeg, gray = self._fetch_crop()
+        except CameraOff as exc:
+            # kinect-knob's scheduled night off: not an error, nothing seen.
+            return {"ok": True, "changed": False, "camera_off": str(exc)}
         except requests.RequestException as exc:
             return {"ok": False, "error": f"snapshot failed: {exc}"}
         luma = float(gray.mean())
@@ -1592,6 +1750,12 @@ class Syncer:
             if late:
                 return {"ok": True, "changed": False, "person": late,
                         "person_late": True, **base}
+            if self.watcher.supported and any(
+                    self.watcher.status(b) == "unknown" for b in ("work", "personal")):
+                # The watcher lost its view while the shutter was open — most
+                # likely the camera restarting under the capture. Nobody can
+                # vouch for this frame; the next interval costs nothing.
+                return {"ok": True, "changed": False, "person_unknown": True, **base}
         try:
             seen = self.reader.read(jpeg)
         except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
@@ -1626,6 +1790,25 @@ class Syncer:
                 log.warning("tick-confirm read failed (%s); ticks deferred", exc)
             seen = confirm_ticks(seen, seen2)
             base["tick_confirmed"] = seen2 is not None
+        if not dry:
+            wipe = self._wipe_imminent(seen, force_protect)
+            if wipe:
+                # Second photo + read before an empty read completes a stack
+                # of tasks. Still empty: a real wipe, proceed. Anything there
+                # (or no second read): absence proves nothing this scan.
+                try:
+                    jpeg3, _ = self._fetch_crop()
+                    seen3 = self.reader.read(jpeg3)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("wipe-confirm read failed (%s); completions deferred", exc)
+                    seen3 = None
+                disputed = [b for b in wipe if seen3 is None
+                            or seen3.get(b) or seen3.get(f"{b}_done")]
+                base["wipe_confirmed"] = [b for b in wipe if b not in disputed]
+                if disputed:
+                    log.info("empty read of %s disputed by a second read; "
+                             "absence deferred", disputed)
+                    force_protect = tuple(sorted(set(force_protect) | set(disputed)))
         blocked = [b for b in ("work", "personal") if seen.get(f"{b}_obstructed")]
         if blocked:
             base["obstructed"] = blocked
@@ -1649,6 +1832,8 @@ class Syncer:
         c["scans"] += 1
         if not result.get("ok"):
             c["errors"] += 1
+        elif result.get("camera_off"):
+            c["skips_camera_off"] += 1
         elif result.get("person"):
             c["skips_person_late" if result.get("person_late") else "skips_person"] += 1
         elif result.get("person_unknown"):
@@ -1701,10 +1886,20 @@ class Syncer:
             self.last_scan_t = time.time()  # re-check one interval later
             self._gate_skip("home")
             return
+        if self.watcher.camera_off:
+            # kinect-knob's night window: nothing to photograph. Record it
+            # once per window, not every interval all night.
+            self.last_scan_t = time.time()
+            if not self._camera_off_noted:
+                self._camera_off_noted = True
+                self._gate_skip("camera_off")
+            return
+        self._camera_off_noted = False
         self.scan(trigger="interval")
 
     def _gate_skip(self, reason: str) -> None:
-        self.counters["skips_home" if reason == "home" else "skips_off"] += 1
+        self.counters[{"home": "skips_home", "camera_off": "skips_camera_off"}
+                      .get(reason, "skips_off")] += 1
         self.gate = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
                      "t": round(time.time(), 1), "reason": reason}
         self._record({"type": "skip", "reason": reason})
@@ -2048,8 +2243,11 @@ function outcome(r) {
     : (r.action === 'reopen' ? 'reopened' : 'removed') +
       ' (' + r.board + '): “' + r.text + '”';
   if (r.type === 'skip') return r.reason === 'home'
-    ? 'skipped — ' + who() + ' was home' : 'skipped — scheduled scans off';
+    ? 'skipped — ' + who() + ' was home'
+    : r.reason === 'camera_off' ? 'camera off for the night — scans paused'
+    : 'skipped — scheduled scans off';
   if (r.error) return 'error: ' + r.error;
+  if (r.camera_off) return 'camera off (' + r.camera_off + ') — skipped';
   if (r.dark) return 'too dark to read (luma ' + r.luma + ') — skipped';
   if (r.person) return (r.person_late
       ? 'skipped — someone stepped in front of the ' + r.person.join(' + ') + ' board'
@@ -2072,6 +2270,10 @@ function outcome(r) {
     s += ' (' + r.obstructed.join(' + ') + ' board blocked — completions deferred)';
   if (Array.isArray(r.slowed) && r.slowed.length)
     s += ' (mass-erase guard: ' + r.slowed.join(' + ') + ' completions slowed)';
+  if (Array.isArray(r.parked) && r.parked.length)
+    s += ', ' + r.parked.length + ' ticked before confirmation (no task): ' + r.parked.join(', ');
+  if (Array.isArray(r.orphaned) && r.orphaned.length)
+    s += ', ' + r.orphaned.length + ' already gone from Todoist (settled): ' + r.orphaned.join(', ');
   if (r.tick_confirmed === false)
     s += ' (confirm photo failed — tick completions deferred)';
   if (r.dim) s += ' (low light: 32-frame stack, completions deferred)';
@@ -2484,7 +2686,7 @@ function render() {
     c.errors + ' errors · ' + c.skips_home + ' home-skips · ' + c.skips_off + ' off-skips · ' +
     (c.skips_person || 0) + ' person-skips · ' +
     (c.skips_person_late || 0) + ' spoiled mid-photo · ' +
-    (c.skips_dim || 0) + ' dim-skips';
+    (c.skips_dim || 0) + ' dim-skips · ' + (c.skips_camera_off || 0) + ' camera-off';
   $('meta').textContent = 'model ' + cfg.model + ' · crop region ' + cfg.region.join(',') +
     ' · photo: ' + set.capture_frames + ' frames stacked, ' + set.capture_format +
     (set.capture_format === 'jpeg' ? ' q' + set.capture_quality : '') +

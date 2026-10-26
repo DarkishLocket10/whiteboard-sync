@@ -205,3 +205,43 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   Saving a new region deletes `baseline.npy` so the next scan reads fresh.
   Upscale is 1–3x but clamped to `MODEL_MAX_PIXELS` (1.6 MP, the known-good
   size for `num_ctx 6144`); raise `num_ctx` before raising that cap.
+
+## Camera-off nights and the 2026-10-26 review fixes
+
+- **kinect-knob switches its camera off 20:00-06:30 America/New_York**
+  (`KK_OFF_WINDOW`) and answers `/api/snapshot`, `/api/region_depth` and
+  region `/api/presence` with **503 `{"camera": "off", "detail": ...}`**.
+  `camera_off_detail()` recognises it; `_grab_frame`/`live_frame` raise
+  `CameraOff` (a `RequestException`, so old handlers still catch it); a scan
+  that hits it returns `camera_off` (not an error); `PresenceWatcher` slows to
+  60 s polls and `tick()` skips scans entirely, recording ONE `camera_off`
+  skip per night. Snapshot failures never counted as misses — that was
+  already safe — they just logged an error every interval all night.
+- **No presence evidence is not "clear".** A watcher error or camera-off
+  503 now drops its readings at once; `_presence_blocked` falls through to the
+  depth fallback ("none" if that is dead too) unless BOTH boards read fresh
+  "clear"; the settle window restarts after any outage; and a post-capture
+  re-check that finds a board "unknown" skips the frame (`person_unknown`).
+- **Pending items no longer vanish on one tick read.** A trusted tick on a
+  pending item is a streak, like on an open item: `ticked_to_complete`
+  consecutive ticks (and the tick-confirm photo, which now covers pending
+  items) park it as done without a task, logged and reported as `parked`;
+  read open in between and it becomes a normal task. Items first seen
+  already ticked start as pending one tick in. (With `ticked_to_complete`
+  = 1 both still park on the first read — now logged.)
+- **Completions of tasks already gone from Todoist settle locally**
+  (`orphaned`). On a failed `todo.update_item`, `_complete_in_todoist` asks
+  `todo.get_items` whether the task is still open; if not, retrying can never
+  work. Before: "Call Bright Shores", "Send out Vacation email" and "Get
+  medication" (not in todo.inbox at all) failed on every scan for a week —
+  which also blocked the change baseline (every scan "changed", so the
+  static-scene tick guard was permanently open) and fired a tick-confirm
+  photo + second model read every scan.
+- **Empty-read confirmation.** When a board reads EMPTY and absence would
+  complete `MASS_ERASE_MIN`+ tasks, a second photo + read must also be
+  empty; otherwise that board is protected for the scan. A real wipe still
+  completes at the normal threshold (unchanged, tested).
+- Known, deliberately unchanged: containment matching (`match_score`) can
+  pair a NEW longer line with an erased shorter item ("Call Veer" ->
+  "Call Veer re: dinner") — a length-ratio rule would break documented real
+  truncations ("pe Express" is 34% of "Europe Express Change Request").

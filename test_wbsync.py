@@ -1650,3 +1650,150 @@ def test_framing_preview_rejects_a_bad_draft(tmp_path):
     s = make_syncer(tmp_path)
     code, out = s.framing_preview({"region": [0, 0, 5000, 10]})
     assert code == 400 and "region" in out["rejected"]
+
+
+# -- 2026-10-26 review fixes ---------------------------------------------------
+def test_one_tick_read_no_longer_parks_a_pending_item(tmp_path):
+    """The silent pending->done path: ONE misread box used to park a real new
+    item as done — no task, no log, no trace."""
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.update_settings({"ticked_to_complete": 2})
+    s.reconcile({"work": ["Pay rent"], "personal": []})
+    r = s.reconcile({"work": [], "work_done": ["Pay rent"], "personal": []})
+    item = s.state["items"][0]
+    assert item["status"] == "pending" and item["ticked"] == 1
+    assert "parked" not in r and s.ha.calls == []
+    # read open next: the tick was a misread — the task gets created
+    r = s.reconcile({"work": ["Pay rent"], "personal": []})
+    assert r["added"] == ["Pay rent"] and s.state["items"][0]["status"] == "open"
+
+
+def test_pending_item_ticked_on_consecutive_reads_parks_and_says_so(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.update_settings({"ticked_to_complete": 2})
+    s.reconcile({"work": ["quick job"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["quick job"], "personal": []})
+    r = s.reconcile({"work": [], "work_done": ["quick job"], "personal": []})
+    assert r["parked"] == ["quick job"] and s.ha.calls == []
+    assert s.state["items"][0]["status"] == "done"
+
+
+def test_first_seen_ticked_needs_the_streak_too(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.update_settings({"ticked_to_complete": 2})
+    s.reconcile({"work": [], "work_done": ["new thing"], "personal": []})
+    assert s.state["items"][0]["status"] == "pending"
+    s.reconcile({"work": ["new thing"], "personal": []})     # tick was a misread
+    assert s.state["items"][0]["status"] == "open"
+    assert s.ha.calls[-1][:2] == ("todoist", "new_task")
+
+
+def test_pending_tick_triggers_the_confirm_photo(tmp_path):
+    s = make_syncer(tmp_path, sightings_to_add=2)
+    s.update_settings({"ticked_to_complete": 2})
+    s.reconcile({"work": ["quick job"], "personal": []})
+    s.reconcile({"work": [], "work_done": ["quick job"], "personal": []})
+    assert s._tick_completion_imminent({"work_done": ["quick job"]})
+
+
+class OrphanHA(FakeHA):
+    """HA whose to-do list no longer has the task (done in Todoist directly)."""
+    def __init__(self, open_now):
+        super().__init__()
+        self.open_now = open_now
+
+    def call(self, domain, service, data):
+        self.calls.append((domain, service, data))
+        return service != "update_item"     # completions 400
+
+    def open_items(self, entity):
+        return self.open_now
+
+
+def test_completion_of_a_task_gone_from_todoist_settles_instead_of_retrying(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["Call Bright Shores"], "personal": []})
+    s.ha = OrphanHA(open_now=["something else"])
+    s.reconcile({"work": [], "personal": []})
+    r = s.reconcile({"work": [], "personal": []})
+    assert r["failed"] == 0 and r["orphaned"] == ["Call Bright Shores"]
+    assert s.state["items"] == []
+
+
+def test_completion_failure_with_the_task_still_open_keeps_retrying(tmp_path):
+    s = make_syncer(tmp_path)
+    s.reconcile({"work": ["Get medication"], "personal": []})
+    s.ha = OrphanHA(open_now=["Get medication"])
+    r = s.reconcile({"work": [], "work_done": ["Get medication"], "personal": []})
+    assert r["failed"] == 1 and "orphaned" not in r
+    assert s.state["items"][0]["status"] == "open"
+
+
+def test_camera_off_scans_are_quiet_skips_not_errors(tmp_path):
+    from wbsync import CameraOff
+
+    s = make_syncer(tmp_path)
+
+    def off(frames=None):
+        raise CameraOff("scheduled off until 06:30")
+
+    s._fetch_crop = off
+    s.settings["depth_skip"] = False
+    r = s.scan(force=True)
+    assert r["ok"] and r["camera_off"] and s.counters["errors"] == 0
+    assert s.counters["skips_camera_off"] == 1
+
+
+def test_scheduler_records_the_night_window_once(tmp_path):
+    s = make_syncer(tmp_path)      # reader=None: a real scan attempt would error
+    s.watcher.camera_off = "scheduled off until 06:30"
+    for _ in range(3):
+        s.last_scan_t = 0
+        s.tick()
+    skips = [h for h in s.history if h.get("reason") == "camera_off"]
+    assert len(skips) == 1 and s.counters["errors"] == 0
+
+
+def test_camera_off_detail_reads_kinect_knobs_503():
+    from wbsync import camera_off_detail
+
+    class R:
+        status_code = 503
+
+        def json(self):
+            return {"error": "camera off", "camera": "off",
+                    "detail": "scheduled off until 06:30"}
+
+    assert camera_off_detail(R()) == "scheduled off until 06:30"
+    R.status_code = 200
+    assert camera_off_detail(R()) is None
+
+
+def test_presence_without_fresh_readings_is_not_clear(tmp_path):
+    s = make_syncer(tmp_path)
+    s.watcher.supported = True       # worked once...
+    s.watcher.boards = {}            # ...but has no current readings
+    s._depth_obstructed = lambda: []
+    s._depth_ok = False
+    blocked, via = s._presence_blocked()
+    assert blocked == [] and via == "none"
+
+
+def test_empty_read_disputed_by_a_second_read_completes_nothing(tmp_path):
+    s = make_syncer(tmp_path)
+    texts = ["a one", "b two", "c three", "d four"]
+    s.reconcile({"work": texts, "personal": []})
+    s.reconcile({"work": [], "personal": []})               # miss 1
+    reads = iter([{"work": [], "personal": []},             # empty read...
+                  {"work": texts, "personal": []}])         # ...second disagrees
+
+    class Seq:
+        def read(self, jpeg):
+            return next(reads)
+
+    s.reader = Seq()
+    fake_fetch(s)
+    s.settings["tick_confirm"] = False
+    r = s.scan(force=True)
+    assert r["completed"] == [] and r["protected"] == ["work"]
+    assert len(s.state["items"]) == 4
