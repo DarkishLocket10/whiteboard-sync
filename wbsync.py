@@ -2150,8 +2150,9 @@ class Syncer:
 
 # Monitoring dashboard, served at GET /. Self-contained (inline CSS/JS, no
 # external assets); data comes from GET /api/status polled every 5s. Colors
-# follow the validated reference dataviz palette, light + dark.
-DASHBOARD_HTML = """<!doctype html>
+# follow the validated reference dataviz palette, light + dark. A raw string,
+# so JS escapes like "\u201c" reach the browser as written.
+DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -2160,140 +2161,251 @@ DASHBOARD_HTML = """<!doctype html>
 <title>whiteboard-sync</title>
 <style>
 :root{
-  --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --page:#f9f9f7; --surface:#fcfcfb; --sunk:#f1f0ec; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
   --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
   --series:#2a78d6; --good:#0ca30c; --warn:#fab219; --serious:#ec835a; --crit:#d03b3b;
+  --r:12px;
 }
 @media (prefers-color-scheme: dark){:root{
-  --page:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7;
+  --page:#0d0d0d; --surface:#1a1a19; --sunk:#141413; --ink:#ffffff; --ink2:#c3c2b7;
   --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10); --series:#3987e5;
 }}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
+html{scroll-padding-top:70px}
 body{margin:0;background:var(--page);color:var(--ink);
   font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:1020px;margin:0 auto;padding:20px 16px 40px}
-header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:14px}
-h1{font-size:17px;font-weight:600;margin:0}
+main{max-width:1760px;margin:0 auto;padding:0 28px 48px}
+@media(max-width:700px){main{padding:0 14px 40px}}
+
+/* ---- header -------------------------------------------------------------- */
+header{position:sticky;top:0;z-index:6;display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;
+  padding:14px 0 12px;margin-bottom:6px;background:var(--page);border-bottom:1px solid var(--border)}
+h1{font-size:17px;font-weight:650;margin:0;white-space:nowrap}
 h1 small{color:var(--muted);font-weight:400;font-size:12px;margin-left:8px}
 .pill{display:inline-flex;align-items:center;gap:7px;padding:4px 12px;border:1px solid var(--border);
-  border-radius:999px;background:var(--surface);font-size:13px;color:var(--ink2)}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+  border-radius:999px;background:var(--surface);font-size:13px;color:var(--ink2);max-width:100%}
+.pill span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none;display:inline-block}
 .pill.good .dot{background:var(--good)} .pill.warn .dot{background:var(--warn)}
 .pill.crit .dot{background:var(--crit)} .pill.busy .dot{background:var(--series);animation:pulse 1.2s infinite}
 @keyframes pulse{50%{opacity:.3}}
 .spacer{flex:1}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
 button{font:inherit;font-size:13px;color:var(--ink);background:var(--surface);
-  border:1px solid var(--border);border-radius:8px;padding:6px 14px;cursor:pointer}
+  border:1px solid var(--border);border-radius:8px;padding:6px 14px;cursor:pointer;white-space:nowrap}
 button:hover{border-color:var(--axis)} button:disabled{opacity:.45;cursor:default}
-#note{font-size:12px;color:var(--ink2);min-height:16px;margin:0 0 12px}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px}
-.tile,.card{background:var(--surface);border:1px solid var(--border);border-radius:10px}
-.tile{padding:12px 14px}
-.tile .label{font-size:12px;color:var(--ink2)}
-.tile .value{font-size:21px;font-weight:600;margin:2px 0}
-.tile .sub{font-size:12px;color:var(--muted)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
-@media(max-width:720px){.grid2{grid-template-columns:1fr}}
-.card{padding:14px 16px;margin-bottom:12px}
-.card h2{font-size:13px;font-weight:600;margin:0 0 10px;color:var(--ink2)}
-.card h2 small{color:var(--muted);font-weight:400;float:right}
+button:focus-visible,summary:focus-visible{outline:2px solid var(--series);outline-offset:2px}
+button.primary{background:var(--series);color:#fff;border-color:transparent}
+button.primary:hover{filter:brightness(1.08)}
+button.primary:disabled{background:var(--surface);color:var(--ink)}
+button.ghost{background:transparent}
+
+/* ---- banners --------------------------------------------------------------- */
+#banners{display:grid;gap:8px;margin:12px 0 0}
+#banners:empty{display:none}
+.banner{display:flex;gap:12px;align-items:flex-start;padding:10px 14px;border-radius:10px;
+  border:1px solid var(--border);border-left:4px solid var(--muted);background:var(--surface);font-size:13px}
+.banner b{font-weight:600}
+.banner.crit{border-left-color:var(--crit)} .banner.warn{border-left-color:var(--warn)}
+.banner .ic{font-weight:700;flex:none;width:18px;text-align:center}
+.banner.crit .ic{color:var(--crit)} .banner.warn .ic{color:var(--serious)}
+.banner .txt{flex:1;color:var(--ink2)} .banner .txt b{color:var(--ink)}
+.banner button{padding:3px 10px;font-size:12px;flex:none}
+
+/* ---- tiles ---------------------------------------------------------------- */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(190px,44vw),1fr));gap:12px;margin:14px 0}
+.tile,.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r)}
+.tile{padding:12px 16px;min-width:0}
+.tile .label{font-size:12px;color:var(--ink2);display:flex;align-items:center;gap:6px}
+.tile .value{font-size:22px;font-weight:650;margin:2px 0;font-variant-numeric:tabular-nums;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .sub{font-size:12px;color:var(--muted);overflow-wrap:break-word}
+.tile.crit{border-color:color-mix(in srgb,var(--crit) 55%,transparent)}
+.tile.crit .value{color:var(--crit)}
+
+/* ---- layout grids ------------------------------------------------------------ */
+.boards{display:grid;gap:12px;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1.15fr);
+  align-items:start;margin-bottom:12px}
+@media(max-width:1280px){.boards{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+  .boards .photo{grid-column:1/-1}}
+@media(max-width:760px){.boards{grid-template-columns:minmax(0,1fr)}}
+.card{padding:14px 18px;margin-bottom:12px;min-width:0}
+.boards .card{margin-bottom:0}
+.card-h{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px;margin:0 0 10px}
+.card-h h2{font-size:14px;font-weight:650;margin:0;color:var(--ink)}
+.card-h .count{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.card-h .right{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hint{font-size:12px;color:var(--muted)}
+.chip{font-size:12px;color:var(--ink2);border:1px solid var(--border);border-radius:999px;
+  padding:1px 9px;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;line-height:20px}
+.chip .dot{width:7px;height:7px}
+.empty{color:var(--muted);font-size:13px}
+
+/* ---- board lists ---------------------------------------------------------------
+   Each row is a three-column grid: status box | text | state + actions. The
+   text column is minmax(0,1fr), so no neighbour can squeeze it into a
+   one-letter-wide column. That squeeze is what made text "break apart" (a
+   float from the header pushed into the first row). */
 ul.items{list-style:none;margin:0;padding:0}
-ul.items li{display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:3px 4px;margin:0 -4px;border-top:1px solid var(--grid);font-size:13px;
-  border-radius:7px}
-ul.items li:first-child{border-top:0}
+ul.items li{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:10px;
+  padding:7px 8px;margin:0 -8px;border-radius:8px;font-size:14px}
+ul.items li + li{box-shadow:0 -1px 0 var(--grid)}
 ul.items li:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
-ul.items li.done .txt{text-decoration:line-through;color:var(--muted)}
 ul.items li.busy{opacity:.5;pointer-events:none}
-/* The text IS the edit affordance: one click opens an inline field. The old
-   dashboard put edits behind a blocking window.prompt(), which is slow, ugly
-   and cannot be tabbed through. */
-ul.items li .txt{flex:1;overflow-wrap:anywhere;cursor:text;padding:3px 4px;
-  margin:-3px -4px;border-radius:5px}
+ul.items li.empty{display:block;padding:10px 0}
+.box{width:15px;height:15px;border:1.5px solid var(--ink2);border-radius:4px;position:relative}
+.box.done{background:var(--good);border-color:var(--good)}
+.box.done::after{content:"";position:absolute;left:4px;top:1px;width:4px;height:8px;
+  border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
+.box.pending{border-style:dashed;border-color:var(--warn)}
+.box.removed{border-color:var(--muted);opacity:.6}
+.box.removed::after{content:"";position:absolute;left:-2px;right:-2px;top:5px;border-top:1.5px solid var(--muted);transform:rotate(-45deg)}
+ul.items li .txt{overflow-wrap:break-word;cursor:text;padding:2px 4px;margin:-2px -4px;border-radius:5px}
 ul.items li .txt:hover{box-shadow:inset 0 -1px 0 var(--axis)}
 ul.items li .txt:focus-visible{outline:2px solid var(--series);outline-offset:1px}
-ul.items li input.edit{flex:1;font:inherit;font-size:13px;color:var(--ink);
-  background:var(--page);border:1px solid var(--series);border-radius:6px;
-  padding:2px 5px;margin:-3px 0;min-width:0;width:100%}
-ul.items li .end{display:flex;align-items:center;gap:4px;flex:none}
-button.ib{padding:0;width:26px;height:24px;line-height:22px;font-size:13px;
+ul.items li.done .txt,ul.items li.removed .txt{text-decoration:line-through;color:var(--muted)}
+ul.items li.pending .txt{font-style:italic;color:var(--ink2)}
+ul.items li input.edit{font:inherit;color:var(--ink);background:var(--page);border:1px solid var(--series);
+  border-radius:6px;padding:2px 6px;margin:-3px 0;min-width:0;width:100%}
+ul.items li .end{display:flex;align-items:center;gap:6px;justify-content:flex-end}
+.acts{display:flex;gap:2px;opacity:0;transition:opacity .12s}
+ul.items li:hover .acts,ul.items li:focus-within .acts{opacity:1}
+@media(hover:none){.acts{opacity:1}}
+button.ib{padding:0;width:28px;height:26px;line-height:24px;font-size:14px;
   border-radius:6px;color:var(--muted);background:transparent;border-color:transparent}
 button.ib:hover{color:var(--ink);background:var(--surface);border-color:var(--border)}
 button.ib.danger:hover{color:var(--crit)}
-#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:9;
-  display:none;align-items:center;gap:14px;background:var(--surface);color:var(--ink);
-  border:1px solid var(--axis);border-radius:10px;padding:9px 14px;font-size:13px;
-  box-shadow:0 4px 18px rgba(0,0,0,.18);max-width:min(560px,92vw)}
-#toast .msg{overflow-wrap:anywhere}
-#toast button{padding:3px 11px;font-size:12px}
-.hint{font-size:11px;color:var(--muted);font-weight:400;margin-left:8px}
-.chip{font-size:11px;color:var(--ink2);border:1px solid var(--border);border-radius:999px;
-  padding:1px 8px;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
-.chip .dot{width:7px;height:7px}
-.empty{color:var(--muted);font-size:13px}
-.setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:0 22px}
-.setrow{display:flex;align-items:center;justify-content:space-between;gap:10px;
-  padding:6px 0;border-top:1px solid var(--grid);font-size:13px}
-.setrow label{color:var(--ink2)}
-input[type=checkbox]{width:16px;height:16px;accent-color:var(--series);margin:0}
-input[type=number],select{font:inherit;font-size:13px;color:var(--ink);background:var(--page);
-  border:1px solid var(--border);border-radius:6px;padding:3px 6px;width:82px}
-img#crop{display:block;width:100%;border-radius:8px;border:1px solid var(--border)}
-#chartwrap{position:relative}
-svg{display:block;width:100%;height:auto}
+.cardfoot{margin-top:10px;font-size:12px;color:var(--muted)}
+@media(max-width:600px){
+  /* phones: the state chip + buttons drop under the text instead of squeezing it */
+  ul.items li:has(.chip){grid-template-columns:16px minmax(0,1fr);row-gap:4px}
+  ul.items li:has(.chip) .end{grid-column:2;justify-content:flex-start}
+  .tile .value{font-size:19px}
+  th:nth-child(n+3),td:nth-child(n+3){display:none}
+  header .actions{width:100%} header .actions button{flex:1}
+}
+
+/* ---- photo ---------------------------------------------------------------- */
+.photo a{display:block}
+img#crop{display:block;width:100%;max-height:62vh;object-fit:contain;background:var(--sunk);
+  border-radius:8px;border:1px solid var(--border)}
+
+/* ---- activity -------------------------------------------------------------------- */
+#tl-wrap{position:relative;margin:4px 0 6px}
+#tl{display:block;width:100%;height:56px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--ink2);margin:4px 0 12px}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
 #tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--axis);
   border-radius:8px;padding:6px 10px;font-size:12px;color:var(--ink);display:none;
-  box-shadow:0 2px 10px rgba(0,0,0,.12);white-space:nowrap;z-index:2}
+  box-shadow:0 2px 10px rgba(0,0,0,.14);max-width:360px;z-index:3}
 #tip .t{color:var(--muted)}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;padding:4px 11px;font-size:12px;background:transparent;color:var(--ink2)}
+.seg button[aria-pressed=true]{background:var(--sunk);color:var(--ink);font-weight:600}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{font-size:11px;font-weight:600;color:var(--muted);text-align:left;padding:2px 8px 6px}
-td{padding:5px 8px;border-top:1px solid var(--grid);vertical-align:top}
+th{font-size:11px;font-weight:600;color:var(--muted);text-align:left;padding:2px 8px 6px;white-space:nowrap}
+td{padding:6px 8px;border-top:1px solid var(--grid);vertical-align:top}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.when{white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--ink2)}
 tr.skip td{color:var(--muted)}
-td .dot{display:inline-block;margin-right:6px}
-footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
+td .dot{margin-right:7px;vertical-align:1px}
+.x{display:inline-block;margin-left:8px;font-size:11px;color:var(--ink2);background:var(--sunk);
+  border-radius:999px;padding:0 7px;font-variant-numeric:tabular-nums}
+.tasks-cell .add{color:var(--good)} .tasks-cell .rm{color:var(--serious)}
 .scroll{overflow-x:auto}
-/* Framing editor. The camera can't zoom or pan, so the box IS the zoom and
-   pan: everything outside it is dimmed, the dashed line is the work|personal
-   divider the presence guards use. All geometry is in % of the frame, so it
-   scales with the card. */
+.more{margin-top:10px}
+
+/* ---- controls ---------------------------------------------------------------- */
+.groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.group{background:var(--sunk);border-radius:10px;padding:10px 14px 4px}
+.group h3{font-size:12px;font-weight:650;color:var(--ink2);margin:2px 0 4px;text-transform:uppercase;letter-spacing:.04em}
+.setrow{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;
+  padding:8px 0;border-top:1px solid var(--grid)}
+.group h3 + .setrow{border-top:0}
+.setrow label{font-size:13px;color:var(--ink);cursor:pointer}
+.setrow .desc{display:block;font-size:12px;color:var(--muted);margin-top:1px}
+.setrow .ok{font-size:11px;color:var(--good);margin-right:6px;opacity:0;transition:opacity .3s}
+.setrow .ok.on{opacity:1}
+.setrow .ctl{display:flex;align-items:center}
+input[type=number],select{font:inherit;font-size:13px;color:var(--ink);background:var(--page);
+  border:1px solid var(--border);border-radius:6px;padding:4px 7px;width:92px}
+select{width:auto;min-width:92px}
+input.switch{appearance:none;-webkit-appearance:none;width:36px;height:21px;border-radius:999px;
+  background:var(--axis);position:relative;cursor:pointer;margin:0;transition:background .15s;flex:none}
+input.switch::before{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+  background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .15s}
+input.switch:checked{background:var(--series)}
+input.switch:checked::before{transform:translateX(15px)}
+input.switch:focus-visible{outline:2px solid var(--series);outline-offset:2px}
+
+/* ---- framing (collapsible) --------------------------------------------------------- */
+details.card{padding:0}
+details.card > summary{list-style:none;cursor:pointer;padding:14px 18px;display:flex;align-items:center;
+  flex-wrap:wrap;gap:6px 12px}
+details.card > summary::-webkit-details-marker{display:none}
+details.card > summary h2{font-size:14px;font-weight:650;margin:0}
+details.card > summary::before{content:"";width:7px;height:7px;border:solid var(--ink2);
+  border-width:0 2px 2px 0;transform:rotate(-45deg);transition:transform .15s;margin-right:2px}
+details.card[open] > summary::before{transform:rotate(45deg)}
+details.card > .body{padding:0 18px 16px}
+.fr-layout{display:grid;grid-template-columns:minmax(0,2.2fr) minmax(300px,1fr);gap:16px;align-items:start}
+@media(max-width:1100px){.fr-layout{grid-template-columns:minmax(0,1fr)}}
 .stage{position:relative;overflow:hidden;border-radius:8px;border:1px solid var(--border);
   background:#000;aspect-ratio:16/9;touch-action:none;user-select:none;cursor:crosshair}
 .stage img{display:block;width:100%;height:100%;object-fit:fill;pointer-events:none}
-.stage .loading{position:absolute;inset:0;display:grid;place-items:center;color:#bbb;font-size:13px}
+.stage .loading{position:absolute;inset:0;display:grid;place-items:center;color:#bbb;font-size:13px;padding:20px;text-align:center}
 #fr-box{position:absolute;box-shadow:0 0 0 9999px rgba(0,0,0,.55);outline:2px solid #fab219;
   cursor:move;touch-action:none}
 #fr-box:focus-visible{outline:3px solid #3987e5}
 #fr-box .h{position:absolute;width:14px;height:14px;background:#fab219;border:2px solid #0b0b0b;
-  border-radius:3px;margin:-7px 0 0 -7px}
+  border-radius:3px;margin:-7px 0 0 -7px;z-index:2}
 #fr-box .h.nw{left:0;top:0;cursor:nwse-resize} #fr-box .h.n{left:50%;top:0;cursor:ns-resize}
 #fr-box .h.ne{left:100%;top:0;cursor:nesw-resize} #fr-box .h.e{left:100%;top:50%;cursor:ew-resize}
 #fr-box .h.se{left:100%;top:100%;cursor:nwse-resize} #fr-box .h.s{left:50%;top:100%;cursor:ns-resize}
 #fr-box .h.sw{left:0;top:100%;cursor:nesw-resize} #fr-box .h.w{left:0;top:50%;cursor:ew-resize}
-#fr-split{position:absolute;top:0;bottom:0;width:16px;margin-left:-8px;cursor:col-resize}
+#fr-split{position:absolute;top:0;bottom:0;width:16px;margin-left:-8px;cursor:col-resize;z-index:1}
 #fr-split::after{content:"";position:absolute;left:7px;top:0;bottom:0;border-left:2px dashed #fab219}
 #fr-split.auto::after{opacity:.55}
+/* "writing ends here": below it the presence + depth guards look away */
+#fr-ib-shade{position:absolute;left:0;right:0;bottom:0;pointer-events:none;
+  background:repeating-linear-gradient(135deg,rgba(57,135,229,.20) 0 6px,rgba(0,0,0,.25) 6px 12px)}
+#fr-ib{position:absolute;left:0;right:0;height:16px;margin-top:-8px;cursor:row-resize;z-index:1}
+#fr-ib::after{content:"";position:absolute;left:0;right:0;top:7px;border-top:2px dashed #3987e5}
+#fr-ib.auto::after{opacity:.5}
+#fr-ib .lbl{position:absolute;right:6px;top:-12px;font-size:11px;color:#fff;background:#3987e5;
+  padding:0 6px;border-radius:4px;white-space:nowrap;pointer-events:none}
 #fr-box .tag{position:absolute;top:4px;font-size:11px;color:#0b0b0b;background:#fab219;
   padding:0 6px;border-radius:4px;pointer-events:none;white-space:nowrap}
-.frbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:10px 0 0}
-.frbar .grp{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--ink2)}
-.frbar button{padding:4px 10px}
-.frbar button.sq{width:30px;padding:4px 0}
-.frbar input[type=number]{width:70px}
-.frbar input[type=range]{width:140px;accent-color:var(--series)}
-.frbar .primary{background:var(--series);color:#fff;border-color:transparent}
-.frbar .primary:disabled{background:var(--surface);color:var(--ink)}
-#fr-info{font-size:12px;color:var(--ink2);margin:8px 0 0;font-variant-numeric:tabular-nums}
+.fr-side{display:grid;gap:12px}
+.fr-side .grp{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:13px;color:var(--ink2)}
+.fr-side .grp > b{width:100%;font-size:12px;font-weight:650;text-transform:uppercase;letter-spacing:.04em}
+.fr-side button{padding:4px 10px}
+.fr-side button.sq{width:30px;padding:4px 0}
+.fr-side input[type=number]{width:74px}
+.fr-side input[type=range]{flex:1;min-width:100px;accent-color:var(--series)}
+.fr-side .coords{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:6px 8px;align-items:center;width:100%}
+#fr-info{font-size:12px;color:var(--ink2);font-variant-numeric:tabular-nums}
 #fr-info .warn{color:var(--serious)}
-#fr-dirty{color:var(--serious)}
-.frout{display:grid;grid-template-columns:3fr 2fr;gap:12px;margin-top:12px}
-@media(max-width:720px){.frout{grid-template-columns:1fr}}
+#fr-dirty.dirty{color:var(--serious)}
+.frbar{display:flex;flex-wrap:wrap;gap:8px}
+.frout{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:14px;margin-top:14px}
+@media(max-width:900px){.frout{grid-template-columns:minmax(0,1fr)}}
 .frout img{display:block;width:100%;border-radius:8px;border:1px solid var(--border)}
 .frout.stale img{opacity:.45}
-.frout h3{font-size:12px;font-weight:600;color:var(--ink2);margin:0 0 4px}
-.frout ul{list-style:none;margin:0 0 10px;padding:0;font-size:13px}
-.frout li{padding:2px 0;border-top:1px solid var(--grid)}
+.frout h3{font-size:12px;font-weight:650;color:var(--ink2);margin:0 0 4px}
+.frout ul{list-style:none;margin:0 0 12px;padding:0;font-size:13px}
+.frout li{padding:3px 0;border-top:1px solid var(--grid)}
 .frout li.done{color:var(--muted);text-decoration:line-through}
+
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:9;
+  display:none;align-items:center;gap:14px;background:var(--surface);color:var(--ink);
+  border:1px solid var(--axis);border-radius:10px;padding:10px 14px;font-size:13px;
+  box-shadow:0 6px 22px rgba(0,0,0,.2);max-width:min(620px,92vw)}
+#toast .msg{overflow-wrap:anywhere}
+#toast button{padding:3px 11px;font-size:12px}
+footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
 </style>
 </head>
 <body>
@@ -2302,84 +2414,117 @@ footer{color:var(--muted);font-size:12px;margin-top:16px;line-height:1.7}
   <h1>whiteboard-sync<small>boards &rarr; Todoist</small></h1>
   <span class="pill" id="pill"><span class="dot"></span><span id="pilltext">connecting&hellip;</span></span>
   <span class="spacer"></span>
-  <button id="btn-scan">Scan now</button>
-  <button id="btn-dry">Dry run</button>
-  <button id="btn-relearn" title="Tell the camera the boards are empty right now — use after moving the camera, the boards, or anything parked in front of them">Relearn empty boards</button>
+  <div class="actions">
+    <button id="btn-relearn" class="ghost" title="Tell the camera the boards are empty right now. Use after moving the camera, the boards, or anything parked in front of them">Relearn empty boards</button>
+    <button id="btn-dry" title="Photograph and read the boards now, and show what would change. Todoist is not touched">Dry run</button>
+    <button id="btn-scan" class="primary" title="Photograph and read the boards now, even if someone is at them">Scan now</button>
+  </div>
 </header>
-<div id="note"></div>
+<div id="banners"></div>
 
 <section class="tiles">
-  <div class="tile"><div class="label">Sync state</div><div class="value" id="t-state">&ndash;</div><div class="sub" id="t-state-sub"></div></div>
-  <div class="tile"><div class="label" id="t-next-label">Next check</div><div class="value" id="t-next">&ndash;</div><div class="sub" id="t-next-sub"></div></div>
-  <div class="tile"><div class="label">Tracked items</div><div class="value" id="t-items">&ndash;</div><div class="sub" id="t-items-sub"></div></div>
-  <div class="tile"><div class="label">Last scan</div><div class="value" id="t-last">&ndash;</div><div class="sub" id="t-last-sub"></div></div>
+  <div class="tile" id="tile-state"><div class="label">Status</div><div class="value" id="t-state">&ndash;</div><div class="sub" id="t-state-sub"></div></div>
+  <div class="tile" id="tile-read"><div class="label">Boards last read</div><div class="value" id="t-read">&ndash;</div><div class="sub" id="t-read-sub"></div></div>
+  <div class="tile"><div class="label" id="t-next-label">Next scan</div><div class="value" id="t-next">&ndash;</div><div class="sub" id="t-next-sub"></div></div>
+  <div class="tile"><div class="label">Open tasks</div><div class="value" id="t-items">&ndash;</div><div class="sub" id="t-items-sub"></div></div>
+  <div class="tile" id="tile-model"><div class="label">Vision model</div><div class="value" id="t-model">&ndash;</div><div class="sub" id="t-model-sub"></div></div>
 </section>
 
-<div class="grid2">
-  <section class="card"><h2>Work board <span class="hint">click text to edit · Tab for the next · × to delete</span><small id="pres-work"></small></h2><ul class="items" id="list-work"></ul></section>
-  <section class="card"><h2>Personal board<small id="pres-personal"></small></h2><ul class="items" id="list-personal"></ul></section>
-</div>
+<section class="boards">
+  <section class="card"><div class="card-h"><h2>Work</h2><span class="count" id="count-work"></span>
+    <span class="right" id="pres-work"></span></div>
+    <ul class="items" id="list-work"></ul></section>
+  <section class="card"><div class="card-h"><h2>Personal</h2><span class="count" id="count-personal"></span>
+    <span class="right" id="pres-personal"></span></div>
+    <ul class="items" id="list-personal"></ul></section>
+  <section class="card photo"><div class="card-h"><h2>Latest photo</h2>
+    <span class="right hint" id="crop-cap"></span></div>
+    <a id="crop-link" href="/crop.jpg" target="_blank" rel="noopener" title="Open full size"><img id="crop" alt="What the vision model was last sent" hidden></a>
+    <div class="empty" id="crop-empty">No photo captured yet.</div>
+  </section>
+</section>
+<p class="hint" style="margin:0 0 14px">Click an item to edit it (Enter saves, Esc cancels, Tab moves to the next). Hover a row for &#x21a9; reopen and &times; delete.</p>
 
-<section class="card"><h2>Controls <small>changes apply immediately and persist</small></h2>
-  <div id="settings" class="setgrid"></div>
+<section class="card" id="activity"><div class="card-h"><h2>Activity</h2><span class="count" id="tl-range"></span>
+  <span class="right"><span class="seg" role="group" aria-label="History filter">
+    <button data-filter="all" aria-pressed="true">Everything</button>
+    <button data-filter="reads" aria-pressed="false">Reads &amp; changes</button>
+  </span></span></div>
+  <div id="tl-wrap"><svg id="tl" viewBox="0 0 1000 56" preserveAspectRatio="none" role="img" aria-label="Scan outcomes over time"></svg><div id="tip"></div></div>
+  <div class="legend" id="tl-legend"></div>
+  <div class="scroll"><table>
+    <thead><tr><th>When</th><th>What happened</th><th>Tasks</th><th class="num">Took</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table></div>
+  <div class="more"><button id="btn-more" hidden>Show more</button></div>
 </section>
 
-<section class="card"><h2>Camera framing
-    <span class="hint">drag the box to pan · drag a handle to zoom · drag outside to draw a new box · dashed line = where the work board ends</span>
-    <small id="fr-dirty"></small></h2>
-  <div class="stage" id="fr-stage">
-    <img id="fr-img" alt="Full camera frame" hidden>
-    <div class="loading" id="fr-loading">Loading camera frame&hellip;</div>
-    <div id="fr-box" tabindex="0" aria-label="Crop box: arrow keys pan, + and - zoom">
-      <span class="tag" id="fr-tag-l">work</span><span class="tag" id="fr-tag-r">personal</span>
-      <div id="fr-split" title="Work | personal divider for the presence guard. Double-click to return to the middle."></div>
-      <i class="h nw"></i><i class="h n"></i><i class="h ne"></i><i class="h e"></i>
-      <i class="h se"></i><i class="h s"></i><i class="h sw"></i><i class="h w"></i>
+<section class="card"><div class="card-h"><h2>Controls</h2>
+  <span class="right hint">Changes apply at once and persist</span></div>
+  <div class="groups" id="settings"></div>
+</section>
+
+<details class="card" id="framing">
+  <summary><h2>Camera framing</h2><span class="hint" id="fr-summary"></span>
+    <span class="spacer"></span><span class="hint" id="fr-dirty"></span></summary>
+  <div class="body">
+  <p class="hint" style="margin:0 0 10px">Drag the box to pan, a handle to resize, or outside it to draw a new one.
+    The <b style="color:#fab219">yellow dashed line</b> splits work from personal. Drag the <b style="color:#3987e5">blue dashed line</b> up to where the writing ends: nobody is "at the board" if they're only in front of the blank space below it.</p>
+  <div class="fr-layout">
+    <div>
+      <div class="stage" id="fr-stage">
+        <img id="fr-img" alt="Full camera frame" hidden>
+        <div class="loading" id="fr-loading">Open to load the camera frame&hellip;</div>
+        <div id="fr-box" tabindex="0" aria-label="Crop box: arrow keys pan, + and - zoom">
+          <span class="tag" id="fr-tag-l">work</span><span class="tag" id="fr-tag-r">personal</span>
+          <div id="fr-ib-shade"></div>
+          <div id="fr-split" title="Work | personal divider for the presence guard. Double-click to return to the middle."></div>
+          <div id="fr-ib" title="Where the writing ends. The presence and depth guards ignore the board below it. Double-click to watch the whole crop."><span class="lbl" id="fr-ib-lbl">writing ends</span></div>
+          <i class="h nw"></i><i class="h n"></i><i class="h ne"></i><i class="h e"></i>
+          <i class="h se"></i><i class="h s"></i><i class="h sw"></i><i class="h w"></i>
+        </div>
+      </div>
+      <div id="fr-info" style="margin-top:8px"></div>
     </div>
-  </div>
-  <div class="frbar">
-    <span class="grp">Zoom <button class="sq" id="fr-zout" title="Zoom out">&minus;</button>
-      <input type="range" id="fr-zoom" min="1" max="8" step="0.05" aria-label="Zoom">
-      <button class="sq" id="fr-zin" title="Zoom in">+</button></span>
-    <span class="grp">Pan <button class="sq" data-pan="-1,0" title="Left">&larr;</button><button class="sq" data-pan="0,-1" title="Up">&uarr;</button><button class="sq" data-pan="0,1" title="Down">&darr;</button><button class="sq" data-pan="1,0" title="Right">&rarr;</button></span>
-    <span class="grp">x1 <input type="number" id="fr-x1" step="2"> y1 <input type="number" id="fr-y1" step="2">
-      x2 <input type="number" id="fr-x2" step="2"> y2 <input type="number" id="fr-y2" step="2">
-      split <input type="number" id="fr-sp" step="2" title="0 = middle of the box"></span>
-  </div>
-  <div class="setgrid" id="fr-settings" style="margin-top:8px"></div>
-  <div id="fr-info"></div>
-  <div class="frbar">
-    <button id="fr-refresh" title="Take a fresh full-frame photo">Refresh frame</button>
-    <button id="fr-preview" title="Show exactly what the model would be sent">Preview model view</button>
-    <button id="fr-read" title="Preview, then run the model on it. Nothing is saved and Todoist is not touched">Test read</button>
-    <span class="spacer"></span>
-    <button id="fr-reset" title="Back to WB_REGION from .env (not saved until you press Save)">Default</button>
-    <button id="fr-revert" title="Discard unsaved changes">Revert</button>
-    <button id="fr-save" class="primary">Save framing</button>
+    <div class="fr-side">
+      <div class="grp"><b>Zoom &amp; pan</b>
+        <button class="sq" id="fr-zout" title="Zoom out">&minus;</button>
+        <input type="range" id="fr-zoom" min="1" max="8" step="0.05" aria-label="Zoom">
+        <button class="sq" id="fr-zin" title="Zoom in">+</button>
+        <span style="width:100%"></span>
+        <button class="sq" data-pan="-1,0" title="Left (Shift = bigger step)">&larr;</button><button class="sq" data-pan="0,-1" title="Up">&uarr;</button><button class="sq" data-pan="0,1" title="Down">&darr;</button><button class="sq" data-pan="1,0" title="Right">&rarr;</button>
+      </div>
+      <div class="grp"><b>Coordinates (camera px)</b>
+        <div class="coords">
+          <label for="fr-x1">x1</label><input type="number" id="fr-x1" step="2">
+          <label for="fr-y1">y1</label><input type="number" id="fr-y1" step="2">
+          <label for="fr-x2">x2</label><input type="number" id="fr-x2" step="2">
+          <label for="fr-y2">y2</label><input type="number" id="fr-y2" step="2">
+          <label for="fr-sp" title="0 = middle of the box">split</label><input type="number" id="fr-sp" step="2">
+          <label for="fr-ib-y" title="0 = whole crop">writing ends</label><input type="number" id="fr-ib-y" step="2">
+        </div>
+      </div>
+      <div class="grp" style="display:block"><b>Photo sent to the model</b>
+        <div id="fr-settings"></div></div>
+      <div class="frbar">
+        <button id="fr-refresh" title="Take a fresh full-frame photo">Refresh frame</button>
+        <button id="fr-preview" title="Show exactly what the model would be sent">Preview</button>
+        <button id="fr-read" title="Preview, then run the model on it. Nothing is saved and Todoist is not touched">Test read</button>
+      </div>
+      <div class="frbar">
+        <button id="fr-reset" title="Back to WB_REGION from .env (not saved until you press Save)">Default</button>
+        <button id="fr-revert" title="Discard unsaved changes">Revert</button>
+        <span class="spacer"></span>
+        <button id="fr-save" class="primary">Save framing</button>
+      </div>
+    </div>
   </div>
   <div class="frout" id="fr-out" hidden>
     <div><h3 id="fr-out-cap"></h3><img id="fr-out-img" alt="What the model is sent"></div>
     <div id="fr-out-read"></div>
   </div>
-</section>
-
-<section class="card"><h2>Latest board photo <small id="crop-cap"></small></h2>
-  <img id="crop" alt="Cropped whiteboard snapshot" hidden>
-  <div class="empty" id="crop-empty">No snapshot captured yet.</div>
-</section>
-
-<section class="card"><h2>Change score per scan <small>vs threshold &mdash; details in the table below</small></h2>
-  <div id="chartwrap"><svg id="chart" viewBox="0 0 880 170" role="img" style="display:none"
-    aria-label="Change score per scan"></svg><div id="tip"></div></div>
-  <div class="empty" id="chart-empty">No scans recorded yet.</div>
-</section>
-
-<section class="card"><h2>History <small id="counters"></small></h2>
-  <div class="scroll"><table>
-    <thead><tr><th class="num">Time</th><th>Event</th><th class="num">Diff</th><th>Tasks</th><th class="num">Took</th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table></div>
-</section>
+  </div>
+</details>
 
 <footer id="meta"></footer>
 </main>
@@ -2401,150 +2546,189 @@ const ago = (t) => {
   if (s < 129600) return (s / 3600).toFixed(1) + ' h ago';
   return Math.round(s / 86400) + ' d ago';
 };
+const dur = (s) => s < 90 ? Math.round(s) + ' s' : s < 5400 ? Math.round(s / 60) + ' min'
+  : (s / 3600).toFixed(1) + ' h';
 const mmss = (s) => { s = Math.max(0, Math.round(s));
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+const hhmm = (t) => new Date(t * 1000).toTimeString().slice(0, 5);
 const tstr = (t) => { const d = new Date(t * 1000);
   const today = new Date().toDateString() === d.toDateString();
-  return (today ? '' : (d.getMonth() + 1) + '/' + d.getDate() + ' ') +
-    d.toTimeString().slice(0, 8); };
+  return (today ? '' : d.toLocaleDateString(undefined, { weekday: 'short' }) + ' ') + hhmm(t); };
 const who = () => ((st.presence.entity || '').replace('person.', '').split('_')[0] || 'you');
+const boards = (list) => list.join(' + ') + ' board' + (list.length > 1 ? 's' : '');
 
+// ---- what a history record means, in words ---------------------------------
 function outcome(r) {
-  if (r.type === 'settings') return 'settings: ' + Object.entries(r.changed || {})
-    .map(([k, v]) => k + '=' + v).join(', ');
-  if (r.type === 'manual') return r.action === 'edit'
-    ? 'edited (' + r.board + '): “' + r.from + '” → “' + r.to + '”'
-    : (r.action === 'reopen' ? 'reopened' : 'removed') +
-      ' (' + r.board + '): “' + r.text + '”';
-  if (r.type === 'skip') return r.reason === 'home'
-    ? 'skipped — ' + who() + ' was home'
-    : r.reason === 'camera_off' ? 'camera off for the night — scans paused'
-    : 'skipped — scheduled scans off';
-  if (r.error) return 'error: ' + r.error;
-  if (r.camera_off) return 'camera off (' + r.camera_off + ') — skipped';
-  if (r.dark) return 'too dark to read (luma ' + r.luma + ') — skipped';
+  if (r.type === 'settings') return 'Settings changed: ' + Object.entries(r.changed || {})
+    .map(([k, v]) => k + ' = ' + (Array.isArray(v) ? v.join(',') : v)).join(', ');
+  if (r.type === 'manual') {
+    if (r.action === 'relearn') return 'Camera re-learned the empty boards';
+    if (r.action === 'edit') return 'Edited (' + r.board + '): “' + r.from + '” → “' + r.to + '”';
+    return (r.action === 'reopen' ? 'Reopened' : 'Removed') + ' (' + r.board + '): “' + r.text + '”';
+  }
+  if (r.type === 'skip') return r.reason === 'home' ? 'Skipped: ' + who() + ' was home'
+    : r.reason === 'camera_off' ? 'Camera off for the night; scans paused'
+    : 'Skipped: scheduled scans are off';
+  if (r.error) return errText(r.error);
+  if (r.camera_off) return 'Camera off (' + r.camera_off + ')';
+  if (r.dark) return 'Too dark to read (luma ' + r.luma + ')';
   if (r.person) return (r.person_late
-      ? 'skipped — someone stepped in front of the ' + r.person.join(' + ') + ' board'
-        + (r.person.length > 1 ? 's' : '') + ' while the photo was being taken'
-      : 'skipped — someone at the ' + r.person.join(' + ') + ' board'
-        + (r.person.length > 1 ? 's' : ''))
+      ? 'Skipped: someone stepped in front of the ' + boards(r.person) + ' during the photo'
+      : 'Skipped: someone at the ' + boards(r.person))
     + (r.person_via === 'depth' ? ' (depth percentiles)' : '');
-  if (r.person_unknown) return 'skipped — no presence evidence from the camera';
-  if (r.type === 'manual' && r.action === 'relearn')
-    return 'camera re-learned the empty boards';
-  if (r.dim_skipped) return 'too dim to trust (luma ' + r.luma + ') — skipped';
-  if (r.obstructed === true) return 'board obstructed — left alone';  // legacy records
-  if (r.changed === false) return 'no change';
+  if (r.person_unknown) return 'Skipped: no presence reading from the camera';
+  if (r.dim_skipped) return 'Too dim to trust (luma ' + r.luma + ')';
+  if (r.obstructed === true) return 'Board obstructed; left alone';  // legacy records
+  if (r.changed === false) return 'No change since the last read';
   const a = (r.added || []).length, c = (r.completed || []).length;
-  let s = r.dry ? 'dry run: would add ' + a + ', complete ' + c
-                : a + ' added, ' + c + ' completed';
-  if (Array.isArray(r.pending) && r.pending.length)
-    s += ', ' + r.pending.length + ' new awaiting confirmation';
-  if (Array.isArray(r.obstructed) && r.obstructed.length)
-    s += ' (' + r.obstructed.join(' + ') + ' board blocked — completions deferred)';
-  if (Array.isArray(r.slowed) && r.slowed.length)
-    s += ' (mass-erase guard: ' + r.slowed.join(' + ') + ' completions slowed)';
-  if (Array.isArray(r.parked) && r.parked.length)
-    s += ', ' + r.parked.length + ' ticked before confirmation (no task): ' + r.parked.join(', ');
-  if (Array.isArray(r.orphaned) && r.orphaned.length)
-    s += ', ' + r.orphaned.length + ' already gone from Todoist (settled): ' + r.orphaned.join(', ');
-  if (r.tick_confirmed === false)
-    s += ' (confirm photo failed — tick completions deferred)';
-  if (r.dim) s += ' (low light: 32-frame stack, completions deferred)';
-  if (Array.isArray(r.depth_blocked) && r.depth_blocked.length)
-    s += ' (depth: ' + r.depth_blocked.join(' + ') + ' physically blocked)';
-  if (r.obstructed_ignored) s += ' (obstruction ignored)';               // legacy
-  if (r.failed) s += ' (' + r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry)';
-  return s;
+  let s = r.dry ? 'Dry run: would add ' + a + ', complete ' + c
+                : 'Read the boards: ' + (a || c ? a + ' added, ' + c + ' completed' : 'nothing to change');
+  const extra = [];
+  if (Array.isArray(r.pending) && r.pending.length) extra.push(r.pending.length + ' new awaiting confirmation');
+  if (Array.isArray(r.obstructed) && r.obstructed.length) extra.push(boards(r.obstructed) + ' blocked: ticks and erasures ignored');
+  if (Array.isArray(r.depth_blocked) && r.depth_blocked.length) extra.push('depth: something in front of the ' + boards(r.depth_blocked));
+  if (Array.isArray(r.obstruction_overruled) && r.obstruction_overruled.length)
+    extra.push('model said ' + r.obstruction_overruled.join(' + ') + ' obstructed; depth saw the writing clear');
+  if (Array.isArray(r.slowed) && r.slowed.length) extra.push('mass-erase guard slowed ' + r.slowed.join(' + '));
+  if (Array.isArray(r.parked) && r.parked.length) extra.push('ticked before confirmation (no task): ' + r.parked.join(', '));
+  if (Array.isArray(r.orphaned) && r.orphaned.length) extra.push('already gone from Todoist: ' + r.orphaned.join(', '));
+  if (r.tick_confirmed === false) extra.push('confirm photo failed: ticks deferred');
+  if (r.dim) extra.push('low light: completions deferred');
+  if (r.failed) extra.push(r.failed + ' HA call' + (r.failed > 1 ? 's' : '') + ' failed, will retry');
+  return s + (extra.length ? ' · ' + extra.join(' · ') : '');
+}
+// Raw exception strings, in words. The original stays in the tooltip/title.
+function errText(e) {
+  if (/read failed:.*(timed out|Timeout)/i.test(e)) return 'Vision model didn’t answer in time';
+  if (/read failed:.*(Connection refused|Max retries|NewConnectionError)/i.test(e)) return 'Vision model unreachable (is the ollama container up?)';
+  if (/read failed/i.test(e)) return 'Vision model read failed: ' + e.replace(/^read failed:\s*/, '').slice(0, 140);
+  if (/snapshot failed:.*503/.test(e)) return 'Camera unavailable (kinect-knob answered 503, probably restarting)';
+  if (/snapshot failed/i.test(e)) return 'Couldn’t get a photo from kinect-knob';
+  return 'Error: ' + e;
+}
+// Timeline category: what kind of outcome, for colour + legend.
+const CATS = {
+  read:   { label: 'Read the boards', color: 'var(--series)' },
+  task:   { label: 'Todoist changed', color: 'var(--good)' },
+  person: { label: 'Someone at a board', color: 'var(--warn)' },
+  light:  { label: 'Too dim / dark', color: 'var(--axis)' },
+  idle:   { label: 'Off / unchanged', color: 'var(--grid)' },
+  error:  { label: 'Error', color: 'var(--crit)' },
+};
+function cat(r) {
+  if (r.type !== 'scan') return r.type === 'skip' ? 'idle' : null;
+  if (r.error || r.ok === false) return 'error';
+  if (r.person || r.person_unknown) return 'person';
+  if (r.dark || r.dim_skipped) return 'light';
+  if (r.changed === false || r.camera_off) return 'idle';
+  if (!r.dry && ((r.added || []).length || (r.completed || []).length)) return 'task';
+  return 'read';
 }
 function kind(r) {
-  if (r.type === 'skip' || r.type === 'settings' || r.type === 'manual'
-      || r.changed === false) return 'muted';
-  if (r.error) return 'crit';
-  if (r.failed || r.obstructed || r.obstructed_ignored) return 'warn';
-  return 'good';
+  const c = cat(r);
+  if (c === 'error') return 'crit';
+  if (c === 'task' || c === 'read') return r.failed ? 'warn' : 'good';
+  return 'muted';
 }
+const KINDCOLOR = { good: 'var(--good)', warn: 'var(--warn)', crit: 'var(--crit)', muted: 'var(--muted)' };
 
+// ---- settings -----------------------------------------------------------------
 const SETTINGS_UI = [
-  ['enabled', 'bool', 'Scheduled scans'],
-  ['presence_gate', 'bool', 'Only scan while away'],
-  ['change_detection', 'bool', 'Skip unchanged frames'],
-  ['obstruction_guard', 'bool', 'Skip when obstructed'],
-  ['due_today', 'bool', 'New tasks due today'],
-  ['interval_s', 'num', 'Scan interval (s)', { min: 60, max: 86400, step: 60 }],
-  ['change_threshold', 'num', 'Change threshold', { min: 0.1, max: 50, step: 0.5 }],
-  ['missing_to_complete', 'num', 'Misses to complete', { min: 1, max: 10, step: 1 }],
-  ['ticked_to_complete', 'num', 'Ticks to complete', { min: 1, max: 10, step: 1 }],
-  ['sightings_to_add', 'num', 'Sightings to create task', { min: 1, max: 10, step: 1 }],
-  ['tick_confirm', 'bool', 'Confirm ticks (2nd photo)'],
-  ['low_light_boost', 'bool', 'Low light: stack 32 frames'],
-  ['depth_guard', 'bool', 'Depth guard (ToF obstruction)'],
-  ['depth_skip', 'bool', 'Skip scan when someone is at a board'],
-  ['presence_occupancy', 'num', 'Person sensitivity (board coverage)', { min: 0.002, max: 0.5, step: 0.002 }],
-  ['presence_clear_s', 'num', 'Board must be clear for (s)', { min: 0, max: 600, step: 5 }],
-  ['presence_recheck', 'bool', 'Re-check for a person after the photo'],
-  ['presence_required', 'bool', 'Wait when presence is unknown'],
-  ['dim_skip', 'bool', 'Skip scan when light is dim'],
-  ['dim_luma', 'num', 'Dim threshold (luma 0-255)', { min: 10, max: 150, step: 5 }],
+  ['Scheduling', [
+    ['enabled', 'bool', 'Scheduled scans', 'Master switch. Scan now always works.'],
+    ['interval_s', 'num', 'Scan every (seconds)', '', { min: 60, max: 86400, step: 60 }],
+    ['presence_gate', 'bool', 'Only while away', 'Skip scans while the HA person is home.'],
+    ['change_detection', 'bool', 'Skip unchanged photos', 'No model read when the photo hasn’t changed.'],
+    ['change_threshold', 'num', 'Change threshold', 'Mean pixel difference that counts as a change.', { min: 0.1, max: 50, step: 0.5 }],
+  ]],
+  ['Task rules', [
+    ['sightings_to_add', 'num', 'Reads to create a task', 'A new line must be read this many times in a row.', { min: 1, max: 10, step: 1 }],
+    ['ticked_to_complete', 'num', 'Ticks to complete', 'Consecutive ticked reads before the task is closed.', { min: 1, max: 10, step: 1 }],
+    ['tick_confirm', 'bool', 'Confirm ticks with a 2nd photo', 'Re-photograph and re-read before closing a task.'],
+    ['missing_to_complete', 'num', 'Misses to complete', 'Scans an erased item must be missing first.', { min: 1, max: 10, step: 1 }],
+    ['due_today', 'bool', 'New tasks due today', 'So they show in Todoist’s Today view.'],
+  ]],
+  ['People at the boards', [
+    ['depth_skip', 'bool', 'Skip while someone is at a board', 'Uses the depth camera before taking the photo.'],
+    ['presence_occupancy', 'num', 'Sensitivity (coverage)', 'Share of the watched area that counts as a person.', { min: 0.002, max: 0.5, step: 0.002 }],
+    ['presence_clear_s', 'num', 'Must be clear for (seconds)', 'Settle time after someone steps away.', { min: 0, max: 600, step: 5 }],
+    ['presence_recheck', 'bool', 'Re-check after the photo', 'Throw the photo away if someone stepped in.'],
+    ['presence_required', 'bool', 'Wait when presence is unknown', 'Otherwise read anyway, with the other guards.'],
+    ['depth_guard', 'bool', 'Depth guard while reading', 'Ignore ticks and erasures where something covers the writing.'],
+    ['obstruction_guard', 'bool', 'Trust the model’s “obstructed” flag', 'Ignore ticks and erasures on a board the model calls blocked.'],
+    ['presence_overrides_model', 'bool', 'Depth overrules the model', 'If depth saw the writing clear, ignore the model’s flag.'],
+  ]],
+  ['Light', [
+    ['dim_skip', 'bool', 'Skip dim photos', 'Dim reads invent fragments of text.'],
+    ['dim_luma', 'num', 'Dim below (brightness 0–255)', '', { min: 10, max: 150, step: 5 }],
+    ['low_light_boost', 'bool', 'Stack 32 frames when dim', 'Used by forced scans or with dim skipping off.'],
+  ]],
 ];
-// Photo + image settings live in the framing card: they are drafted, previewed
-// and saved together with the crop box, not applied one control at a time.
+// Photo + image settings live in the framing card: drafted, previewed and
+// saved together with the crop box, not applied one control at a time.
 const FRAMING_UI = [
-  ['enhance', 'bool', 'Enhance photo (contrast+sharpen)'],
+  ['enhance', 'bool', 'Enhance (contrast + sharpen)'],
   ['capture_frames', 'num', 'Frames stacked per photo', { min: 1, max: 32, step: 1 }],
-  ['upscale', 'sel', 'Upscale for model', [['1', '1x'], ['1.5', '1.5x'], ['2', '2x'], ['2.5', '2.5x'], ['3', '3x']]],
-  ['capture_format', 'sel', 'Image format to model', [['jpeg', 'JPEG'], ['png', 'PNG (lossless)']]],
-  ['capture_quality', 'num', 'JPEG quality to model', { min: 50, max: 100, step: 1 }],
+  ['upscale', 'sel', 'Upscale', [['1', '1×'], ['1.5', '1.5×'], ['2', '2×'], ['2.5', '2.5×'], ['3', '3×']]],
+  ['capture_format', 'sel', 'Format', [['jpeg', 'JPEG'], ['png', 'PNG (lossless)']]],
+  ['capture_quality', 'num', 'JPEG quality', { min: 50, max: 100, step: 1 }],
 ];
+function makeInput(type, opt, id) {
+  let inp;
+  if (type === 'bool') { inp = el('input', 'switch'); inp.type = 'checkbox'; inp.setAttribute('role', 'switch'); }
+  else if (type === 'num') { inp = el('input'); inp.type = 'number';
+    inp.min = opt.min; inp.max = opt.max; inp.step = opt.step; }
+  else { inp = el('select');
+    for (const [v, l] of opt) { const o = el('option', null, l); o.value = v; inp.appendChild(o); } }
+  inp.id = id;
+  return inp;
+}
 let settingsBuilt = false;
 function buildSettings() {
   const host = $('settings');
-  for (const [key, type, label, opt] of SETTINGS_UI) {
-    const row = el('div', 'setrow');
-    const lab = el('label', null, label); lab.htmlFor = 'set-' + key;
-    row.appendChild(lab);
-    let inp;
-    if (type === 'bool') { inp = el('input'); inp.type = 'checkbox'; }
-    else if (type === 'num') { inp = el('input'); inp.type = 'number';
-      inp.min = opt.min; inp.max = opt.max; inp.step = opt.step; }
-    else { inp = el('select');
-      for (const [v, l] of opt) { const o = el('option', null, l); o.value = v; inp.appendChild(o); } }
-    inp.id = 'set-' + key;
-    inp.addEventListener('change', async () => {
-      let val;
-      if (type === 'bool') val = inp.checked;
-      else if (type === 'num') val = Number(inp.value);
-      else val = type === 'sel' && key === 'upscale' ? Number(inp.value) : inp.value;
-      try {
-        const r = await fetch('/api/settings', { method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ [key]: val }) });
-        const j = await r.json();
-        const rej = j.rejected && j.rejected[key];
-        $('note').textContent = rej ? label + ': ' + rej
-          : Object.keys(j.applied || {}).length ? 'Saved: ' + label : '';
-      } catch (e) { $('note').textContent = 'Save failed: ' + e; }
-      refresh();
-    });
-    row.appendChild(inp); host.appendChild(row);
+  for (const [title, rows] of SETTINGS_UI) {
+    const g = el('div', 'group'); g.appendChild(el('h3', null, title));
+    for (const [key, type, label, desc, opt] of rows) {
+      const row = el('div', 'setrow');
+      const lab = el('label', null, label); lab.htmlFor = 'set-' + key;
+      if (desc) lab.appendChild(el('span', 'desc', desc));
+      const inp = makeInput(type, opt, 'set-' + key);
+      const ok = el('span', 'ok', 'saved');
+      const ctl = el('span', 'ctl'); ctl.append(ok, inp);
+      row.append(lab, ctl); g.appendChild(row);
+      inp.addEventListener('change', async () => {
+        const val = type === 'bool' ? inp.checked : Number(inp.value);
+        try {
+          const r = await fetch('/api/settings', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [key]: val }) });
+          const j = await r.json();
+          const rej = j.rejected && j.rejected[key];
+          if (rej) toast(label + ': ' + rej);
+          else { ok.classList.add('on'); setTimeout(() => ok.classList.remove('on'), 1600); }
+        } catch (e) { toast('Save failed: ' + e); }
+        refresh();
+      });
+    }
+    host.appendChild(g);
   }
   settingsBuilt = true;
 }
 function syncSettings() {
   if (!settingsBuilt) buildSettings();
-  for (const [key, type] of SETTINGS_UI) {
+  for (const [, rows] of SETTINGS_UI) for (const [key, type] of rows) {
     const inp = $('set-' + key);
     if (document.activeElement === inp) continue;
     if (type === 'bool') inp.checked = !!st.settings[key];
     else inp.value = String(st.settings[key]);
   }
 }
+
 // ---- framing editor -------------------------------------------------------
 // fr is the DRAFT: the crop box + image settings being edited. It follows the
 // live settings until the first edit, then holds still until Save or Revert.
 // Coordinates are always full-frame camera pixels (1920x1080).
-const FR_KEYS = ['region', 'split', ...FRAMING_UI.map((f) => f[0])];
-let fr = null, frDirty = false, frGen = 0, frShown = -1;
+const FR_KEYS = ['region', 'split', 'items_bottom', ...FRAMING_UI.map((f) => f[0])];
+let fr = null, frDirty = false, frGen = 0, frShown = -1, frLoaded = false;
 const FW = () => st.config.frame[0], FH = () => st.config.frame[1];
 const MIN_W = 160, MIN_H = 120;
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -2554,14 +2738,16 @@ const sameFraming = (a, b) => JSON.stringify(FR_KEYS.map((k) => a[k])) ===
   JSON.stringify(FR_KEYS.map((k) => b[k]));
 const splitX = () => { const [x1, , x2] = fr.region;
   return fr.split > x1 && fr.split < x2 ? fr.split : Math.round((x1 + x2) / 2); };
+const ibActive = (f) => f.items_bottom > f.region[1] && f.items_bottom < f.region[3];
 
-function frSet(region, split) {
+function frSet(region, split, ib) {
   // Keep the box inside the frame and at least MIN_W x MIN_H, rounded to even px.
   let [x1, y1, x2, y2] = region.map((v) => Math.round(v / 2) * 2);
   x1 = clamp(x1, 0, FW() - MIN_W); y1 = clamp(y1, 0, FH() - MIN_H);
   x2 = clamp(x2, x1 + MIN_W, FW()); y2 = clamp(y2, y1 + MIN_H, FH());
   fr.region = [x1, y1, x2, y2];
   if (split !== undefined) fr.split = split;
+  if (ib !== undefined) fr.items_bottom = ib;
   frChanged();
 }
 function frChanged() {
@@ -2571,6 +2757,10 @@ function frChanged() {
 }
 function frScale(w, h) {
   return Math.min(Number(fr.upscale), Math.sqrt(st.config.model_max_pixels / (w * h)));
+}
+function frSummary(f) {
+  return f.region.join(', ') + ' · split ' + (f.split || 'middle') +
+    ' · writing ends ' + (ibActive(f) ? 'at y ' + f.items_bottom : 'at the crop bottom');
 }
 function frDraw() {
   const [x1, y1, x2, y2] = fr.region, w = x2 - x1, h = y2 - y1;
@@ -2582,7 +2772,14 @@ function frDraw() {
   $('fr-split').classList.toggle('auto', !(fr.split > x1 && fr.split < x2));
   $('fr-tag-l').style.left = '4px';
   $('fr-tag-r').style.left = 'calc(' + ((sx - x1) / w * 100) + '% + 6px)';
-  for (const [k, v] of [['x1', x1], ['y1', y1], ['x2', x2], ['y2', y2], ['sp', fr.split]]) {
+  const ibOn = ibActive(fr), ibPct = ibOn ? (fr.items_bottom - y1) / h * 100 : 100;
+  $('fr-ib').style.top = ibPct + '%';
+  $('fr-ib').classList.toggle('auto', !ibOn);
+  $('fr-ib-lbl').textContent = ibOn ? 'writing ends' : 'drag up: where writing ends';
+  $('fr-ib-lbl').style.top = ibOn ? '-12px' : '-20px';
+  $('fr-ib-shade').style.top = ibPct + '%';
+  $('fr-ib-shade').hidden = !ibOn;
+  for (const [k, v] of [['x1', x1], ['y1', y1], ['x2', x2], ['y2', y2], ['sp', fr.split], ['ib-y', fr.items_bottom]]) {
     if (document.activeElement !== $('fr-' + k)) $('fr-' + k).value = v;
   }
   if (document.activeElement !== $('fr-zoom')) $('fr-zoom').value = (FW() / w).toFixed(2);
@@ -2594,14 +2791,16 @@ function frDraw() {
   $('fr-set-capture_quality').disabled = fr.capture_format === 'png';
   const sc = frScale(w, h), mw = Math.round(w * sc), mh = Math.round(h * sc);
   const capped = sc < Number(fr.upscale) - 0.01;
-  $('fr-info').innerHTML = '';
+  $('fr-info').textContent = '';
   $('fr-info').append(
-    'Crop ' + w + '×' + h + ' px of ' + FW() + '×' + FH() + ' · zoom ' + (FW() / w).toFixed(2) +
-    '× · model is sent ' + mw + '×' + mh + ' (' + (mw * mh / 1e6).toFixed(2) + ' MP' +
+    'Crop ' + w + '×' + h + ' of ' + FW() + '×' + FH() + ' · zoom ' + (FW() / w).toFixed(2) +
+    '× · model gets ' + mw + '×' + mh + ' (' + (mw * mh / 1e6).toFixed(2) + ' MP' +
     (sc > 1.01 ? ', ' + sc.toFixed(2) + '× upscale' : sc < 0.99 ? ', shrunk ' + sc.toFixed(2) + '×' : '') + ')');
   if (capped) $('fr-info').append(el('span', 'warn', ' · upscale capped at ' +
     (st.config.model_max_pixels / 1e6).toFixed(1) + ' MP so the image fits the model context'));
-  $('fr-dirty').textContent = frDirty ? 'unsaved changes' : 'saved';
+  $('fr-dirty').textContent = frDirty ? 'Unsaved changes' : '';
+  $('fr-dirty').classList.toggle('dirty', frDirty);
+  $('fr-summary').textContent = frSummary(liveFraming());
   $('fr-save').disabled = !frDirty; $('fr-revert').disabled = !frDirty;
   $('fr-out').classList.toggle('stale', frShown !== frGen);
 }
@@ -2619,11 +2818,12 @@ function frPan(dx, dy) {
   const [x1, y1, x2, y2] = fr.region, w = x2 - x1, h = y2 - y1;
   const nx = clamp(x1 + dx, 0, FW() - w), ny = clamp(y1 + dy, 0, FH() - h);
   const sx = fr.split > x1 && fr.split < x2 ? fr.split + (nx - x1) : fr.split;
-  frSet([nx, ny, nx + w, ny + h], sx);
+  const ib = ibActive(fr) ? fr.items_bottom + (ny - y1) : fr.items_bottom;
+  frSet([nx, ny, nx + w, ny + h], sx, ib);
 }
 
 // Pointer editing: drag the box = pan, a handle = resize that edge/corner,
-// the dashed line = move the divider, empty frame = draw a fresh box.
+// a dashed line = move it, empty frame = draw a fresh box.
 let drag = null;
 function frPoint(e) {
   const r = $('fr-stage').getBoundingClientRect();
@@ -2634,9 +2834,10 @@ function frDown(e) {
   const t = e.target, p = frPoint(e);
   let mode = 'draw';
   if (t.id === 'fr-split') mode = 'split';
+  else if (t.id === 'fr-ib' || t.closest('#fr-ib')) mode = 'ib';
   else if (t.classList.contains('h')) mode = [...t.classList].find((c) => c !== 'h');
   else if (t.closest('#fr-box')) mode = 'move';
-  drag = { mode, p0: p, r0: fr.region.slice(), s0: fr.split };
+  drag = { mode, p0: p, r0: fr.region.slice(), s0: fr.split, ib0: fr.items_bottom };
   $('fr-stage').setPointerCapture(e.pointerId);
   e.preventDefault();
 }
@@ -2649,15 +2850,21 @@ function frMove(e) {
     const w = x2 - x1, h = y2 - y1;
     const nx = clamp(x1 + dx, 0, FW() - w), ny = clamp(y1 + dy, 0, FH() - h);
     const s0 = drag.s0, keep = s0 > x1 && s0 < x2;
-    frSet([nx, ny, nx + w, ny + h], keep ? s0 + (nx - x1) : s0);
+    const ib0 = drag.ib0, keepIb = ib0 > y1 && ib0 < y2;
+    frSet([nx, ny, nx + w, ny + h], keep ? s0 + (nx - x1) : s0, keepIb ? ib0 + (ny - y1) : ib0);
     return;
   }
   if (m === 'split') { frSet(fr.region, Math.round(clamp(px, x1 + 20, x2 - 20) / 2) * 2); return; }
+  if (m === 'ib') {
+    const y = Math.round(clamp(py, y1 + 40, y2) / 2) * 2;
+    frSet(fr.region, undefined, y >= y2 - 6 ? 0 : y);
+    return;
+  }
   if (m === 'draw') {
     const [ax, ay] = drag.p0;
     if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;   // a click, not a drag
     x1 = Math.min(ax, px); x2 = Math.max(ax, px); y1 = Math.min(ay, py); y2 = Math.max(ay, py);
-    frSet([clamp(x1, 0, FW()), clamp(y1, 0, FH()), clamp(x2, 0, FW()), clamp(y2, 0, FH())], 0);
+    frSet([clamp(x1, 0, FW()), clamp(y1, 0, FH()), clamp(x2, 0, FW()), clamp(y2, 0, FH())], 0, 0);
     return;
   }
   if (m.includes('w')) x1 = clamp(x1 + dx, 0, x2 - MIN_W);
@@ -2670,10 +2877,11 @@ function frUp() { drag = null; }
 
 function frLoadFrame() {
   const img = $('fr-img');
+  frLoaded = true;
   $('fr-loading').hidden = false; $('fr-loading').textContent = 'Loading camera frame…';
   img.onload = () => { img.hidden = false; $('fr-loading').hidden = true; };
-  img.onerror = () => { $('fr-loading').hidden = false;
-    $('fr-loading').textContent = 'Camera frame unavailable — is kinect-knob running? Try Refresh frame.'; };
+  img.onerror = () => { img.hidden = true; $('fr-loading').hidden = false;
+    $('fr-loading').textContent = 'Camera frame unavailable (camera off for the night, or kinect-knob restarting). Try Refresh frame.'; };
   img.src = '/api/frame?t=' + Date.now();
 }
 
@@ -2681,7 +2889,7 @@ async function frPreview(read) {
   const btns = ['fr-preview', 'fr-read'].map($);
   btns.forEach((b) => { b.disabled = true; });
   const gen = frGen, label = read ? $('fr-read') : $('fr-preview'), old = label.textContent;
-  label.textContent = read ? 'Reading… (can take 30 s)' : 'Capturing…';
+  label.textContent = read ? 'Reading…' : 'Capturing…';
   try {
     const r = await fetch('/api/framing/preview', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2691,14 +2899,14 @@ async function frPreview(read) {
     $('fr-out').hidden = false;
     $('fr-out-img').src = j.image;
     $('fr-out-cap').textContent = 'Model view ' + j.model[0] + '×' + j.model[1] + ' · ' +
-      Math.round(j.bytes / 1024) + ' KB · luma ' + j.luma +
-      (j.luma < st.settings.dim_luma ? ' (dim — scheduled scans would skip)' : '') +
+      Math.round(j.bytes / 1024) + ' KB · brightness ' + j.luma +
+      (j.luma < st.settings.dim_luma ? ' (dim: scheduled scans would skip)' : '') +
       ' · ' + j.capture_s + ' s to capture';
-    const out = $('fr-out-read'); out.innerHTML = '';
+    const out = $('fr-out-read'); out.textContent = '';
     if (read) frRenderRead(out, j); else
-      out.append(el('div', 'empty', 'Test read runs the vision model on this exact image — nothing is saved and Todoist is not touched.'));
+      out.append(el('div', 'empty', 'Test read runs the vision model on this exact image. Nothing is saved and Todoist is not touched.'));
     frShown = gen; frDraw();
-  } catch (e) { $('note').textContent = 'Framing preview failed: ' + e.message; }
+  } catch (e) { toast('Framing preview failed: ' + e.message); }
   finally { label.textContent = old; btns.forEach((b) => { b.disabled = false; }); }
 }
 function frRenderRead(out, j) {
@@ -2708,7 +2916,7 @@ function frRenderRead(out, j) {
   for (const [board, name] of [['work', 'Work (left)'], ['personal', 'Personal (right)']]) {
     const done = new Set(rd[board + '_done'] || []), order = rd[board + '_order'] || [];
     out.append(el('h3', null, name + ' · ' + order.length + ' items' +
-      (rd[board + '_obstructed'] ? ' · model says OBSTRUCTED' : '')));
+      (rd[board + '_obstructed'] ? ' · model says obstructed' : '')));
     const ul = el('ul');
     if (!order.length) ul.append(el('li', 'done', 'nothing read'));
     for (const t of order) ul.append(el('li', done.has(t) ? 'done' : null, (done.has(t) ? '☑ ' : '☐ ') + t));
@@ -2724,12 +2932,13 @@ async function frSave() {
       body: JSON.stringify(Object.fromEntries(FR_KEYS.map((k) => [k, fr[k]]))) });
     const j = await r.json();
     const rej = Object.entries(j.rejected || {});
-    if (rej.length) { $('note').textContent = 'Not saved: ' + rej.map(([k, v]) => k + ' ' + v).join('; '); return; }
-    $('note').textContent = 'Framing saved — the next scan reads the boards fresh with it' +
-      (j.applied && j.applied.region ? '. If presence starts misbehaving, press Relearn empty boards.' : '.');
+    if (rej.length) { toast('Not saved: ' + rej.map(([k, v]) => k + ' ' + v).join('; ')); return; }
+    toast('Framing saved. The next scan reads the boards fresh' +
+      (j.applied && (j.applied.region || j.applied.items_bottom !== undefined)
+        ? '. If presence misbehaves, press Relearn empty boards.' : '.'));
     await refresh();
     fr = liveFraming(); frDirty = false;   // same framing: a preview of it is still current
-  } catch (e) { $('note').textContent = 'Save failed: ' + e; }
+  } catch (e) { toast('Save failed: ' + e); }
   finally { frDraw(); }
 }
 
@@ -2738,21 +2947,14 @@ function frBuild() {
   for (const [key, type, label, opt] of FRAMING_UI) {
     const row = el('div', 'setrow');
     const lab = el('label', null, label); lab.htmlFor = 'fr-set-' + key;
-    row.appendChild(lab);
-    let inp;
-    if (type === 'bool') { inp = el('input'); inp.type = 'checkbox'; }
-    else if (type === 'num') { inp = el('input'); inp.type = 'number';
-      inp.min = opt.min; inp.max = opt.max; inp.step = opt.step; }
-    else { inp = el('select');
-      for (const [v, l] of opt) { const o = el('option', null, l); o.value = v; inp.appendChild(o); } }
-    inp.id = 'fr-set-' + key;
+    const inp = makeInput(type, opt, 'fr-set-' + key);
+    row.append(lab, inp); host.appendChild(row);
     inp.addEventListener('change', () => {
       if (type === 'bool') fr[key] = inp.checked;
       else if (type === 'num') fr[key] = clamp(Number(inp.value) || opt.min, opt.min, opt.max);
       else fr[key] = key === 'upscale' ? Number(inp.value) : inp.value;
       frChanged();
     });
-    row.appendChild(inp); host.appendChild(row);
   }
   const stage = $('fr-stage');
   stage.addEventListener('pointerdown', frDown);
@@ -2760,6 +2962,7 @@ function frBuild() {
   stage.addEventListener('pointerup', frUp);
   stage.addEventListener('pointercancel', frUp);
   $('fr-split').addEventListener('dblclick', () => frSet(fr.region, 0));
+  $('fr-ib').addEventListener('dblclick', () => frSet(fr.region, undefined, 0));
   $('fr-box').addEventListener('keydown', (e) => {
     const step = e.shiftKey ? 40 : 4;
     const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
@@ -2779,18 +2982,21 @@ function frBuild() {
   }
   for (const k of ['x1', 'y1', 'x2', 'y2']) {
     $('fr-' + k).addEventListener('change', () => {
-      const r = ['x1', 'y1', 'x2', 'y2'].map((n) => Number($('fr-' + n).value) || 0);
-      frSet(r);
+      frSet(['x1', 'y1', 'x2', 'y2'].map((n) => Number($('fr-' + n).value) || 0));
     });
   }
   $('fr-sp').addEventListener('change', () => frSet(fr.region, Math.max(0, Number($('fr-sp').value) || 0)));
+  $('fr-ib-y').addEventListener('change', () => frSet(fr.region, undefined, Math.max(0, Number($('fr-ib-y').value) || 0)));
   $('fr-refresh').onclick = frLoadFrame;
   $('fr-preview').onclick = () => frPreview(false);
   $('fr-read').onclick = () => frPreview(true);
   $('fr-save').onclick = frSave;
   $('fr-revert').onclick = () => { fr = liveFraming(); frChanged(); };
-  $('fr-reset').onclick = () => frSet(st.config.default_region.slice(), 0);
-  frLoadFrame();
+  $('fr-reset').onclick = () => frSet(st.config.default_region.slice(), 0, 0);
+  // The full frame is a fresh camera capture: only take it when someone opens
+  // the editor, not on every page load.
+  $('framing').addEventListener('toggle', () => { if ($('framing').open && !frLoaded) frLoadFrame(); });
+  if ($('framing').open) frLoadFrame();
 }
 function frSync() {
   if (!fr) { fr = liveFraming(); frBuild(); }
@@ -2798,30 +3004,84 @@ function frSync() {
   frDraw();
 }
 
-const KINDCOLOR = { good: 'var(--good)', warn: 'var(--warn)', crit: 'var(--crit)', muted: 'var(--muted)' };
-
+// ---- top of page ---------------------------------------------------------------
 function pill(cls, text) { const p = $('pill'); p.className = 'pill ' + cls; $('pilltext').textContent = text; }
+
+// Why nothing is being read right now, if that's the case: the question the
+// old dashboard left you to work out from the history table.
+function waiting() {
+  const last = st.last && st.last.at ? st.last : null;
+  const w = st.watcher || {};
+  if (w.camera_off) return ['pause', 'Camera off for the night', w.camera_off];
+  if (!last) return null;
+  if (last.person) {
+    const occ = last.person.map((b) => ((w.boards || {})[b] || {}).occupancy)
+      .filter((o) => o != null).map((o) => (o * 100).toFixed(0) + '%');
+    return ['warn', 'Waiting: someone at the ' + boards(last.person),
+      occ.length ? 'watched area covered: ' + occ.join(' / ') : ''];
+  }
+  if (last.person_unknown) return ['warn', 'Waiting: no presence reading', 'the depth camera isn’t answering'];
+  if (last.dim_skipped) return ['pause', 'Waiting for light', 'brightness ' + last.luma + ' < ' + st.settings.dim_luma];
+  if (last.dark) return ['pause', 'Waiting for light', 'too dark to read (brightness ' + last.luma + ')'];
+  return null;
+}
+
+function banners() {
+  const host = $('banners'); host.textContent = '';
+  const add = (cls, ic, html, btn) => {
+    const b = el('div', 'banner ' + cls); b.appendChild(el('span', 'ic', ic));
+    const t = el('span', 'txt'); t.innerHTML = html; b.appendChild(t);
+    if (btn) { const x = el('button', null, btn[0]); x.onclick = btn[1]; b.appendChild(x); }
+    host.appendChild(b);
+  };
+  const m = st.model || {};
+  if (m.failing) add('crit', '!', '<b>The vision model isn’t answering.</b> ' + m.failures +
+    ' reads in a row have failed' + (m.last_ok_t ? '; last good read ' + ago(m.last_ok_t) : '') +
+    '. Timed-out reads unload the model so Ollama starts a fresh runner. If this persists, check the ollama container. <br>Last error: ' +
+    esc(m.last_error || ''));
+  // Long run of person skips: say so plainly and point at the fix.
+  const h = st.history || [];
+  let run = 0, since = null;
+  for (let i = h.length - 1; i >= 0; i--) {
+    const r = h[i];
+    if (r.type !== 'scan') continue;
+    if (!r.person) break;
+    run++; since = r.t;
+  }
+  if (run >= 10) add('warn', 'i', '<b>Nothing has been read for ' + dur(Date.now() / 1000 - since) +
+    '</b>: ' + run + ' scans in a row found someone at the boards. If that’s you at the desk, below the writing, ' +
+    'drag the blue “writing ends” line in Camera framing up to the last line so the blank board below stops counting.',
+    ['Open framing', () => { $('framing').open = true; $('framing').scrollIntoView({ behavior: 'smooth' }); }]);
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function render() {
   const last = st.last && st.last.at ? st.last : null;
   const p = st.presence;
-  const stalled = st.loop_beat_age_s > st.config.interval_s + 900;
+  const stalled = st.loop_beat_age_s > st.settings.interval_s + 900;
+  const wait = waiting();
+  const m = st.model || {};
 
-  if (stalled) pill('crit', 'Scan loop stalled — restart the container');
+  if (stalled) pill('crit', 'Scan loop stalled. Restart the container');
+  else if (m.failing) pill('crit', 'Vision model not answering');
   else if (st.scanning) pill('busy', 'Scanning now…');
   else if (!st.settings.enabled) pill('pause', 'Scheduled scans off');
-  else if (last && last.error) pill('warn', 'Last scan failed — retrying on schedule');
-  else if (last && last.failed) pill('warn', 'HA push failed — will retry');
-  else if (last && Array.isArray(last.obstructed) && last.obstructed.length)
-    pill('warn', last.obstructed.join(' + ') + ' board blocked — completions deferred');
-  else if (p.gates_scans && !p.away) pill('pause', 'Paused — ' + who() + ' is home');
+  else if (p.gates_scans && !p.away) pill('pause', 'Paused: ' + who() + ' is home');
+  else if (last && last.error) pill('warn', 'Last scan failed; retrying on schedule');
+  else if (last && last.failed) pill('warn', 'Todoist update failed; will retry');
+  else if (wait) pill(wait[0], wait[1]);
   else pill('good', 'Watching the boards');
 
   $('t-state').textContent = stalled ? 'Stalled' : st.scanning ? 'Scanning' :
-    !st.settings.enabled ? 'Off' : (p.gates_scans && !p.away) ? 'Paused' : 'Active';
-  $('t-state-sub').textContent = p.entity
-    ? who() + ' is ' + (p.state === null ? 'unknown' : p.state === 'home' ? 'home' : 'away')
-    : 'no presence gate';
+    !st.settings.enabled ? 'Off' : (p.gates_scans && !p.away) ? 'Paused' : wait ? 'Waiting' : 'Active';
+  $('t-state-sub').textContent = wait ? wait[1].replace(/^Waiting: /, '') + (wait[2] ? ' · ' + wait[2] : '')
+    : p.entity ? who() + ' is ' + (p.state === null ? 'unknown' : p.state === 'home' ? 'home' : 'away') : '';
+
+  const lr = st.last_read && st.last_read.t ? st.last_read : null;
+  $('t-read').textContent = lr ? ago(lr.t) : 'not yet';
+  $('t-read-sub').textContent = lr ? outcome(lr).replace(/^Read the boards: /, '')
+    : 'no successful read in the kept history';
+  $('tile-read').classList.toggle('crit', !lr || Date.now() / 1000 - lr.t > 12 * 3600);
 
   $('t-next-label').textContent = !st.settings.enabled ? 'Next enabled check'
     : (p.gates_scans && !p.away) ? 'Next presence check' : 'Next scan';
@@ -2833,133 +3093,171 @@ function render() {
   const w = open.filter((i) => i.board === 'work').length;
   $('t-items').textContent = open.length;
   const doneN = items.filter((i) => i.status === 'done').length;
-  const removedN = items.filter((i) => i.status === 'removed').length;
   const pendingN = items.filter((i) => i.status === 'pending').length;
   $('t-items-sub').textContent = w + ' work · ' + (open.length - w) + ' personal' +
     (pendingN ? ' · ' + pendingN + ' unconfirmed' : '') +
-    (doneN ? ' · ' + doneN + ' ticked on board' : '') +
-    (removedN ? ' · ' + removedN + ' removed' : '');
+    (doneN ? ' · ' + doneN + ' ticked, still on the board' : '');
 
-  $('t-last').textContent = last ? ago(last.t) : 'never';
-  $('t-last-sub').textContent = last ? outcome(last) : 'no scans since start';
+  $('t-model').textContent = m.failing ? 'Failing' : m.failures ? m.failures + ' failed' : m.last_ok_t ? 'OK' : '–';
+  $('t-model-sub').textContent = (st.config.model || '') +
+    (m.last_ok_t ? ' · last answer ' + ago(m.last_ok_t) : '') +
+    (lr && lr.took_s ? ' · last scan ' + lr.took_s + ' s' : '');
+  $('tile-model').classList.toggle('crit', !!m.failing);
 
+  banners();
   lists();
   presenceChips();
 
   if (st.crop_t) {
-    if (st.crop_t !== cropShown) { $('crop').src = '/crop.jpg?t=' + st.crop_t; cropShown = st.crop_t; }
+    if (st.crop_t !== cropShown) { $('crop').src = '/crop.jpg?t=' + st.crop_t;
+      $('crop-link').href = '/crop.jpg?t=' + st.crop_t; cropShown = st.crop_t; }
     $('crop').hidden = false; $('crop-empty').hidden = true;
-    $('crop-cap').textContent = 'captured ' + ago(st.crop_t);
+    $('crop-cap').textContent = 'taken ' + ago(st.crop_t) + (last && last.luma != null ? ' · brightness ' + last.luma : '');
   }
 
-  syncSettings(); frSync(); chart(); table();
+  syncSettings(); frSync(); timeline(); table();
 
   const c = st.counters, cfg = st.config, set = st.settings;
-  $('counters').textContent = 'since start: ' + c.scans + ' scans · ' + c.changed +
-    ' processed · ' + c.unchanged + ' unchanged · ' + c.obstructed + ' obstructed · ' +
-    c.errors + ' errors · ' + c.skips_home + ' home-skips · ' + c.skips_off + ' off-skips · ' +
-    (c.skips_person || 0) + ' person-skips · ' +
-    (c.skips_person_late || 0) + ' spoiled mid-photo · ' +
-    (c.skips_dim || 0) + ' dim-skips · ' + (c.skips_camera_off || 0) + ' camera-off';
-  $('meta').textContent = 'model ' + cfg.model + ' · crop region ' + cfg.region.join(',') +
+  $('meta').textContent = 'model ' + cfg.model +
     ' · photo: ' + set.capture_frames + ' frames stacked, ' + set.capture_format +
     (set.capture_format === 'jpeg' ? ' q' + set.capture_quality : '') +
-    (set.upscale > 1 ? ', ' + set.upscale + 'x upscale' : '') +
-    (set.enhance ? ', enhanced' : '') +
-    ' · Todoist project "' + cfg.todoist_project + '" via ' + cfg.todo_entity +
-    ' · service up since ' + st.started_at +
-    ' · tasks this session: ' + c.added + ' added, ' + c.completed + ' completed';
+    (set.upscale > 1 ? ', ' + set.upscale + '× upscale' : '') + (set.enhance ? ', enhanced' : '') +
+    ' · Todoist project “' + cfg.todoist_project + '” via ' + cfg.todo_entity +
+    ' · up since ' + st.started_at + ' · since then: ' + c.scans + ' scans, ' + c.changed + ' reads, ' +
+    c.errors + ' errors, ' + (c.skips_person || 0) + ' person skips, ' + (c.skips_dim || 0) + ' dim skips · tasks ' +
+    c.added + ' added, ' + c.completed + ' completed';
   countdown();
 }
 
-function chart() {
-  const svg = $('chart');
-  const scans = (st.history || []).filter((h) => h.type === 'scan' && h.diff != null).slice(-48);
-  svg.textContent = '';
-  const has = scans.length > 0;
-  svg.style.display = has ? '' : 'none';
-  $('chart-empty').style.display = has ? 'none' : '';
-  if (!has) return;
-  const W = 880, H = 170, L = 10, R = 84, T = 12, B = 26;
-  const thr = st.config.change_threshold;
-  const maxV = Math.max(thr * 1.5, ...scans.map((s) => s.diff)) * 1.05;
-  const y = (v) => H - B - (v / maxV) * (H - T - B);
-  const slot = (W - L - R) / scans.length;
-  const bw = Math.max(3, Math.min(24, slot - 2));
-  const NS = 'http://www.w3.org/2000/svg';
+// ---- activity: outcome timeline + collapsed history ------------------------------
+function timeline() {
+  const svg = $('tl'), NS = 'http://www.w3.org/2000/svg';
+  const recs = (st.history || []).filter((r) => r.t && cat(r));
+  svg.textContent = ''; $('tl-legend').textContent = '';
+  if (!recs.length) { $('tl-range').textContent = ''; return; }
+  const W = 1000, H = 56, now = Date.now() / 1000;
+  const t0 = Math.max(recs[0].t, now - 48 * 3600), span = Math.max(now - t0, 3600);
+  const x = (t) => (t - t0) / span * W;
   const S = (tag, at) => { const n = document.createElementNS(NS, tag);
     for (const k in at) n.setAttribute(k, at[k]); return n; };
-
-  const thrY = y(thr);
-  svg.appendChild(S('line', { x1: L, x2: W - R + 6, y1: thrY, y2: thrY,
-    stroke: 'var(--axis)', 'stroke-width': 1 }));
-  const lbl = S('text', { x: W - R + 10, y: thrY + 4, fill: 'var(--muted)', 'font-size': 11 });
-  lbl.textContent = 'threshold ' + thr;
-  svg.appendChild(lbl);
-
-  scans.forEach((s, i) => {
-    const x = L + i * slot + (slot - bw) / 2;
-    const top = Math.min(y(s.diff), H - B - 1), h = H - B - top;
-    const r = Math.min(4, bw / 2, h);
-    svg.appendChild(S('path', { fill: 'var(--series)', d:
-      'M' + x + ',' + (H - B) + ' L' + x + ',' + (top + r) +
-      ' Q' + x + ',' + top + ' ' + (x + r) + ',' + top +
-      ' L' + (x + bw - r) + ',' + top +
-      ' Q' + (x + bw) + ',' + top + ' ' + (x + bw) + ',' + (top + r) +
-      ' L' + (x + bw) + ',' + (H - B) + ' Z' }));
-    const hit = S('rect', { x: L + i * slot, y: T, width: slot, height: H - T - B,
-      fill: 'transparent' });
-    hit.addEventListener('mouseenter', () => tip(s, L + i * slot + slot / 2, top));
-    hit.addEventListener('mouseleave', () => { $('tip').style.display = 'none'; });
-    svg.appendChild(hit);
-  });
-
-  svg.appendChild(S('line', { x1: L, x2: W - R + 6, y1: H - B, y2: H - B,
-    stroke: 'var(--axis)', 'stroke-width': 1 }));
-  const t0 = S('text', { x: L, y: H - 8, fill: 'var(--muted)', 'font-size': 11 });
-  t0.textContent = tstr(scans[0].t);
-  svg.appendChild(t0);
-  if (scans.length > 1) {
-    const t1 = S('text', { x: W - R + 6, y: H - 8, fill: 'var(--muted)', 'font-size': 11,
-      'text-anchor': 'end' });
-    t1.textContent = tstr(scans[scans.length - 1].t);
-    svg.appendChild(t1);
+  // night shading: 20:00-06:30 local, when the camera is off
+  for (let d = new Date(t0 * 1000); d.getTime() / 1000 < now; d.setDate(d.getDate() + 1)) {
+    const a = new Date(d); a.setHours(20, 0, 0, 0);
+    const b = new Date(d); b.setDate(b.getDate() + 1); b.setHours(6, 30, 0, 0);
+    const pre = new Date(d); pre.setHours(0, 0, 0, 0);
+    const preEnd = new Date(d); preEnd.setHours(6, 30, 0, 0);
+    for (const [s, e] of [[pre, preEnd], [a, b]]) {
+      const xs = x(Math.max(s.getTime() / 1000, t0)), xe = x(Math.min(e.getTime() / 1000, now));
+      if (xe > xs) svg.appendChild(S('rect', { x: xs, y: 0, width: xe - xs, height: H - 14, fill: 'var(--sunk)' }));
+    }
+  }
+  const counts = {};
+  const hits = [];
+  for (const r of recs) {
+    if (r.t < t0) continue;
+    const c = cat(r); counts[c] = (counts[c] || 0) + 1;
+    const big = c === 'task' || c === 'error';
+    svg.appendChild(S('rect', { x: x(r.t) - 0.9, y: big ? 4 : 12, width: 1.8, height: big ? H - 22 : H - 30,
+      fill: CATS[c].color }));
+    hits.push(r);
+  }
+  svg.appendChild(S('line', { x1: 0, x2: W, y1: H - 14, y2: H - 14, stroke: 'var(--axis)', 'stroke-width': 1,
+    'vector-effect': 'non-scaling-stroke' }));
+  // hour labels every 6 h
+  const lab = new Date(t0 * 1000); lab.setMinutes(0, 0, 0); lab.setHours(Math.ceil(lab.getHours() / 6) * 6);
+  for (; lab.getTime() / 1000 < now; lab.setHours(lab.getHours() + 6)) {
+    const lx = x(lab.getTime() / 1000);
+    if (lx < 20 || lx > W - 20) continue;
+    svg.appendChild(S('line', { x1: lx, x2: lx, y1: H - 14, y2: H - 10, stroke: 'var(--axis)', 'vector-effect': 'non-scaling-stroke' }));
+  }
+  tlLabels(t0, now);
+  $('tl-range').textContent = 'last ' + dur(now - t0) + ' · shaded = camera off at night';
+  for (const k of Object.keys(CATS)) {
+    if (!counts[k]) continue;
+    const s = el('span'); const i = el('i'); i.style.background = CATS[k].color;
+    s.append(i, CATS[k].label + ' ' + counts[k]); $('tl-legend').appendChild(s);
+  }
+  svg.onmousemove = (e) => {
+    const r = svg.getBoundingClientRect(), t = t0 + (e.clientX - r.left) / r.width * span;
+    let best = null, bd = Infinity;
+    for (const h of hits) { const d = Math.abs(h.t - t); if (d < bd) { bd = d; best = h; } }
+    if (!best || bd > span / r.width * 12) { $('tip').style.display = 'none'; return; }
+    const box = $('tip'); box.textContent = '';
+    box.append(el('div', 't', tstr(best.t)), el('div', null, outcome(best)));
+    box.style.display = 'block';
+    const px = (best.t - t0) / span * r.width;
+    box.style.left = clamp(px - 80, 0, $('tl-wrap').clientWidth - box.offsetWidth - 2) + 'px';
+    box.style.top = '-' + (box.offsetHeight + 4) + 'px';
+  };
+  svg.onmouseleave = () => { $('tip').style.display = 'none'; };
+}
+function tlLabels(t0, now) {
+  // HTML labels under the svg (the svg is stretched, so text inside it would distort).
+  let row = $('tl-labels');
+  if (!row) { row = el('div'); row.id = 'tl-labels';
+    row.style.cssText = 'position:relative;height:14px;font-size:11px;color:var(--muted);margin-top:-14px';
+    $('tl-wrap').appendChild(row); }
+  row.textContent = '';
+  const span = now - t0;
+  const lab = new Date(t0 * 1000); lab.setMinutes(0, 0, 0); lab.setHours(Math.ceil(lab.getHours() / 6) * 6);
+  for (; lab.getTime() / 1000 < now; lab.setHours(lab.getHours() + 6)) {
+    const f = (lab.getTime() / 1000 - t0) / span;
+    if (f < .02 || f > .98) continue;
+    const s = el('span', null, lab.getHours() === 0
+      ? lab.toLocaleDateString(undefined, { weekday: 'short' }) : String(lab.getHours()).padStart(2, '0') + ':00');
+    s.style.cssText = 'position:absolute;transform:translateX(-50%);left:' + (f * 100) + '%';
+    row.appendChild(s);
   }
 }
 
-function tip(s, vx, vy) {
-  const box = $('tip'), wrap = $('chartwrap'), svg = $('chart');
-  box.textContent = '';
-  box.appendChild(el('div', 't', tstr(s.t)));
-  box.appendChild(el('div', null, 'diff ' + s.diff));
-  box.appendChild(el('div', null, outcome(s)));
-  const k = svg.getBoundingClientRect().width / 880;
-  box.style.display = 'block';
-  const bx = Math.min(Math.max(vx * k - 60, 0), wrap.clientWidth - box.offsetWidth - 4);
-  box.style.left = bx + 'px';
-  box.style.top = Math.max(vy * k - box.offsetHeight - 10, 0) + 'px';
+let histFilter = 'all', histLimit = 40;
+function groupHistory() {
+  // Collapse runs of identical outcomes ("someone at the boards" x 37) into
+  // one row with a count and a time span.
+  const rows = (st.history || []).slice().reverse();
+  const out = [];
+  for (const r of rows) {
+    if (histFilter === 'reads' && !['read', 'task', 'error'].includes(cat(r)) && r.type !== 'manual') continue;
+    const text = outcome(r), g = out[out.length - 1];
+    const simple = !((r.added || []).length || (r.completed || []).length) && r.type !== 'manual' && r.type !== 'settings';
+    if (g && simple && g.simple && g.text === text) { g.n++; g.first = r.t; continue; }
+    out.push({ r, text, simple, n: 1, first: r.t, last: r.t });
+  }
+  return out;
 }
-
 function table() {
   const tb = $('rows'); tb.textContent = '';
-  const rows = (st.history || []).slice(-60).reverse();
-  if (!rows.length) { const tr = el('tr'); const td = el('td', 'empty', 'nothing yet');
-    td.colSpan = 5; tr.appendChild(td); tb.appendChild(tr); return; }
-  for (const r of rows) {
-    const tr = el('tr', kind(r) === 'muted' ? 'skip' : null);
-    tr.appendChild(el('td', 'num', tstr(r.t)));
-    const ev = el('td');
-    const d = el('span', 'dot'); d.style.background = KINDCOLOR[kind(r)];
-    ev.appendChild(d); ev.appendChild(document.createTextNode(outcome(r)));
+  const groups = groupHistory();
+  if (!groups.length) { const tr = el('tr'); const td = el('td', 'empty', 'Nothing yet.');
+    td.colSpan = 4; tr.appendChild(td); tb.appendChild(tr); $('btn-more').hidden = true; return; }
+  for (const g of groups.slice(0, histLimit)) {
+    const r = g.r, k = kind(r);
+    const tr = el('tr', k === 'muted' ? 'skip' : null);
+    tr.appendChild(el('td', 'when', g.n > 1 ? tstr(g.first) + ' – ' + hhmm(g.last) : tstr(r.t)));
+    const ev = el('td'); const d = el('span', 'dot'); d.style.background = KINDCOLOR[k];
+    ev.append(d, g.text);
+    if (r.error) ev.title = r.error;
+    if (g.n > 1) ev.appendChild(el('span', 'x', '×' + g.n));
     tr.appendChild(ev);
-    tr.appendChild(el('td', 'num', r.diff != null ? r.diff.toFixed(1) : ''));
-    const a = (r.added || []).length, c = (r.completed || []).length;
-    tr.appendChild(el('td', null, r.type === 'scan' && (a || c)
-      ? (a ? '+' + a + ' ' : '') + (c ? '−' + c : '') : ''));
-    tr.appendChild(el('td', 'num', r.took_s != null ? r.took_s + 's' : ''));
+    const td = el('td', 'tasks-cell');
+    if (r.type === 'scan' && !r.dry) {
+      for (const t of r.added || []) td.append(el('div', 'add', '+ ' + t));
+      for (const t of r.completed || []) td.append(el('div', 'rm', '✓ ' + t));
+    }
+    tr.appendChild(td);
+    tr.appendChild(el('td', 'num', r.took_s != null && r.took_s >= 0.5 ? r.took_s + ' s' : ''));
     tb.appendChild(tr);
   }
+  $('btn-more').hidden = groups.length <= histLimit;
 }
+for (const b of document.querySelectorAll('[data-filter]')) {
+  b.addEventListener('click', () => {
+    histFilter = b.dataset.filter; histLimit = 40;
+    for (const o of document.querySelectorAll('[data-filter]')) o.setAttribute('aria-pressed', String(o === b));
+    table();
+  });
+}
+$('btn-more').addEventListener('click', () => { histLimit += 60; table(); });
 
 async function refresh() {
   try {
@@ -2976,6 +3274,7 @@ function countdown() {
   $('t-next').textContent = mmss(left);
 }
 
+// ---- board lists + inline editing ---------------------------------------------
 async function itemCall(path, body, okMsg, it, onOk) {
   // Mark the row busy immediately so a second click cannot race the first:
   // edits and deletes take a Home Assistant round-trip, and the scan lock can
@@ -2989,9 +3288,9 @@ async function itemCall(path, body, okMsg, it, onOk) {
     const j = await r.json();
     ok = !j.error;
     warning = j.warning || null;
-    $('note').textContent = j.error ? 'Failed: ' + j.error
-      : (okMsg || '') + (warning ? ' — warning: ' + warning : '');
-  } catch (e) { $('note').textContent = 'Request failed: ' + e; }
+    if (j.error) toast('Failed: ' + j.error);
+    else if (okMsg && !warning) toast(okMsg);
+  } catch (e) { toast('Request failed: ' + e); }
   if (key) busyKeys.delete(key);
   await refresh();
   // Outside the try on purpose: a bug in a toast callback must not be
@@ -3001,49 +3300,38 @@ async function itemCall(path, body, okMsg, it, onOk) {
   return ok;
 }
 function presenceChips() {
-  // Say plainly, per board, whether the camera can see a person in front of
-  // it — the thing that decides whether a scan happens at all.
+  // Per board: can the camera see somebody in front of the writing? That's
+  // what decides whether a scan happens at all.
   const w = (st.watcher) || {};
   for (const board of ['work', 'personal']) {
     const host = $('pres-' + board);
-    if (!host) continue;
-    if (w.supported === false) { host.textContent = 'no depth presence signal'; continue; }
+    host.textContent = '';
+    const chip = (color, text, title) => { const c = el('span', 'chip');
+      const d = el('span', 'dot'); d.style.background = color; c.append(d, text);
+      if (title) c.title = title; host.appendChild(c); };
+    if (w.camera_off) { chip('var(--muted)', 'camera off'); continue; }
+    if (w.supported === false) { chip('var(--muted)', 'no depth signal'); continue; }
     const rec = (w.boards || {})[board];
-    if (!rec || rec.age_s > 30) {
-      host.textContent = w.error ? 'presence unknown — camera unreachable'
-                                 : 'presence unknown';
-      continue;
-    }
-    if (rec.blocked) {
-      host.textContent = 'someone is at this board (' +
-        (rec.occupancy * 100).toFixed(1) + '% covered) — not scanning';
-      continue;
-    }
-    const need = st.settings.presence_clear_s || 0;
-    const clear = rec.clear_for_s;
-    host.textContent = (clear !== null && clear < need)
-      ? 'clear for ' + Math.round(clear) + 's — waiting for ' + need + 's'
-      : 'clear';
+    if (!rec || rec.age_s > 30) { chip('var(--muted)', 'presence unknown', w.error || ''); continue; }
+    const pct = (rec.occupancy * 100).toFixed(1) + '%';
+    if (rec.blocked) { chip('var(--warn)', 'someone in front · ' + pct,
+      'Share of the watched area in front of the board. Scheduled scans wait until it clears.'); continue; }
+    const need = st.settings.presence_clear_s || 0, clear = rec.clear_for_s;
+    if (clear !== null && clear < need) chip('var(--muted)', 'clear ' + Math.round(clear) + '/' + need + ' s');
+    else chip('var(--good)', 'clear');
   }
 }
 
-// -- item list + inline editing ---------------------------------------------
-// Editing used to go through window.prompt() and deleting through
-// window.confirm(): two blocking modal windows per change, no keyboard flow,
-// and a 5s poll that would rebuild the list underneath you. Now the text IS
-// the field, Enter commits, Tab walks the list, and delete is one click with
-// an undo — so cleaning up a board's worth of OCR wobble takes seconds.
 let editing = null;      // {board, text} while an inline editor is open
 let pendingEdit = null;  // {board, index} -> open an editor after the next build
 let busyKeys = new Set();
-
 const keyOf = (it) => it.board + '\u0000' + it.text;
 
 function itemState(it) {
-  if (it.status === 'done') return ['var(--good)', 'done — erase whenever'];
-  if (it.status === 'removed') return ['var(--muted)', 'removed — ignored until erased'];
+  if (it.status === 'done') return ['var(--good)', 'done · erase whenever'];
+  if (it.status === 'removed') return ['var(--muted)', 'removed · ignored until erased'];
   if (it.status === 'pending')
-    return ['var(--warn)', 'seen ' + it.seen + '/' + st.settings.sightings_to_add + ' — no task yet'];
+    return ['var(--warn)', 'new · seen ' + it.seen + '/' + st.settings.sightings_to_add];
   if (it.ticked > 0)
     return ['var(--good)', 'ticked ' + it.ticked + '/' + st.settings.ticked_to_complete];
   if (it.missing > 0)
@@ -3060,23 +3348,25 @@ function lists() {
     const ul = $('list-' + board); ul.textContent = '';
     const rows = items.filter((i) => i.board === board)
       .sort((a, b) => (a.pos ?? 1e9) - (b.pos ?? 1e9));  // as written on the board
-    if (!rows.length) { ul.appendChild(el('li', 'empty', 'nothing tracked')); continue; }
+    const openN = rows.filter((i) => i.status === 'open').length;
+    $('count-' + board).textContent = openN + ' open' + (rows.length > openN ? ' · ' + (rows.length - openN) + ' other' : '');
+    if (!rows.length) { ul.appendChild(el('li', 'empty', 'Nothing tracked on this board.')); continue; }
     rows.forEach((it, index) => {
-      const cls = [];
-      if (it.status === 'done' || it.status === 'removed') cls.push('done');
+      const cls = [it.status];
       if (busyKeys.has(keyOf(it))) cls.push('busy');
-      const li = el('li', cls.join(' ') || null);
+      const li = el('li', cls.join(' '));
+      const box = el('span', 'box ' + it.status);
+      box.title = { open: 'Open: a live Todoist task', done: 'Ticked: task completed',
+        pending: 'Seen, not yet confirmed: no task yet', removed: 'Removed by hand' }[it.status] || '';
+      li.appendChild(box);
 
       const txt = el('span', 'txt', it.text);
       txt.tabIndex = 0;
-      txt.title = 'Click to edit · Delete to remove';
+      txt.title = 'Click to edit · Delete key to remove';
       txt.addEventListener('click', () => startEdit(li, it, board, index));
       txt.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Enter' || ev.key === 'F2') {
-          ev.preventDefault(); startEdit(li, it, board, index);
-        } else if (ev.key === 'Delete') {
-          ev.preventDefault(); removeItem(it);
-        }
+        if (ev.key === 'Enter' || ev.key === 'F2') { ev.preventDefault(); startEdit(li, it, board, index); }
+        else if (ev.key === 'Delete') { ev.preventDefault(); removeItem(it); }
       });
       li.appendChild(txt);
 
@@ -3085,23 +3375,25 @@ function lists() {
       if (state) {
         const chip = el('span', 'chip');
         const d = el('span', 'dot'); d.style.background = state[0];
-        chip.appendChild(d);
-        chip.appendChild(document.createTextNode(state[1]));
+        chip.append(d, state[1]);
         end.appendChild(chip);
       }
+      const acts = el('span', 'acts');
       if (it.status === 'done' || it.status === 'removed') {
-        const br = el('button', 'ib', '\u21a9');
-        br.title = 'Mark as not done — creates a fresh Todoist task';
+        const br = el('button', 'ib', '↩');
+        br.title = 'Mark as not done: creates a fresh Todoist task';
+        br.setAttribute('aria-label', 'Reopen ' + it.text);
         br.addEventListener('click', () => reopenItem(it));
-        end.appendChild(br);
+        acts.appendChild(br);
       }
       if (it.status !== 'removed') {
-        const bx = el('button', 'ib danger', '\u00d7');
-        bx.title = it.status === 'open'
-          ? 'Delete — removes the Todoist task (undoable)' : 'Remove from tracking';
+        const bx = el('button', 'ib danger', '×');
+        bx.title = it.status === 'open' ? 'Delete: removes the Todoist task (undoable)' : 'Remove from tracking';
+        bx.setAttribute('aria-label', 'Remove ' + it.text);
         bx.addEventListener('click', () => removeItem(it));
-        end.appendChild(bx);
+        acts.appendChild(bx);
       }
+      end.appendChild(acts);
       li.appendChild(end);
       ul.appendChild(li);
 
@@ -3135,9 +3427,8 @@ function startEdit(li, it, board, index) {
     editing = null;
     if (thenEdit !== undefined) pendingEdit = { board: board, index: thenEdit };
     if (!save || !next || next === it.text) { lists(); return; }
-    itemCall('/api/items/edit',
-             { board: it.board, text: it.text, new_text: next },
-             'Renamed to \u201c' + next + '\u201d', it);
+    itemCall('/api/items/edit', { board: it.board, text: it.text, new_text: next },
+             'Renamed to “' + next + '”', it);
   };
   inp.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
@@ -3153,26 +3444,24 @@ function startEdit(li, it, board, index) {
 
 function removeItem(it) {
   // No confirm dialog. Deleting an OPEN item removes its Todoist task, and
-  // reopen puts that task back verbatim — a real undo, so the honest UI is
+  // reopen puts that task back verbatim: a real undo, so the honest UI is
   // "do it, offer the undo". The other states touch no live task, so there is
   // nothing an undo could faithfully restore and none is offered.
   const undoable = it.status === 'open';
   itemCall('/api/items/remove', { board: it.board, text: it.text }, null, it,
            () => undoable
-             ? toast('Deleted \u201c' + it.text + '\u201d', 'Undo',
-                     () => itemCall('/api/items/reopen',
-                                    { board: it.board, text: it.text },
-                                    'Restored \u201c' + it.text + '\u201d', it))
+             ? toast('Deleted “' + it.text + '”', 'Undo',
+                     () => itemCall('/api/items/reopen', { board: it.board, text: it.text },
+                                    'Restored “' + it.text + '”', it))
              : toast(it.status === 'pending'
-                       ? 'Dropped \u201c' + it.text + '\u201d — it had no task yet'
-                       : 'Removed \u201c' + it.text + '\u201d from tracking'));
+                       ? 'Dropped “' + it.text + '”. It had no task yet'
+                       : 'Removed “' + it.text + '” from tracking'));
 }
 
 function reopenItem(it) {
   itemCall('/api/items/reopen', { board: it.board, text: it.text }, null, it,
-           () => toast('Reopened \u201c' + it.text + '\u201d as a fresh Todoist ' +
-                       'task. If the checkbox is still marked on the board, wipe ' +
-                       'it off — otherwise the next scans just complete it again.'));
+           () => toast('Reopened “' + it.text + '” as a fresh Todoist task. ' +
+                       'If its box is still ticked on the board, wipe the tick off, or the next scans close it again.', null, null, 9000));
 }
 
 let toastTimer = null;
@@ -3184,19 +3473,21 @@ function toast(msg, actionLabel, onAction, ms) {
   act.onclick = actionLabel ? () => { hideToast(); onAction(); } : null;
   box.style.display = 'flex';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(hideToast, ms || (actionLabel ? 9000 : 5000));
+  toastTimer = setTimeout(hideToast, ms || (actionLabel ? 9000 : 6000));
 }
 function hideToast() { clearTimeout(toastTimer); $('toast').style.display = 'none'; }
 
 async function doScan(dry) {
+  const b = dry ? $('btn-dry') : $('btn-scan'), old = b.textContent;
   $('btn-scan').disabled = $('btn-dry').disabled = true;
-  $('note').textContent = (dry ? 'Dry-run scan' : 'Scan') +
-    ' started — the vision model can take a few minutes on first load…';
+  b.textContent = dry ? 'Reading…' : 'Scanning…';
+  pill('busy', (dry ? 'Dry run' : 'Scan') + ' running. A cold model takes up to a minute');
   try {
     const r = await fetch('/scan?force=1' + (dry ? '&dry=1' : ''), { method: 'POST' });
     const j = await r.json();
-    $('note').textContent = 'Result: ' + outcome(j);
-  } catch (e) { $('note').textContent = 'Scan request failed: ' + e; }
+    toast(outcome(j), null, null, 12000);
+  } catch (e) { toast('Scan request failed: ' + e); }
+  b.textContent = old;
   $('btn-scan').disabled = $('btn-dry').disabled = false;
   refresh();
 }
@@ -3204,8 +3495,7 @@ $('btn-relearn').addEventListener('click', async () => {
   const b = $('btn-relearn'); b.disabled = true;
   try {
     const j = await (await fetch('/api/presence/relearn', { method: 'POST' })).json();
-    toast(j.error ? 'Relearn failed: ' + j.error
-                  : 'The camera has re-learned the empty boards.');
+    toast(j.error ? 'Relearn failed: ' + j.error : 'The camera has re-learned the empty boards.');
   } catch (e) { toast('Relearn failed: ' + e); }
   b.disabled = false;
   refresh();

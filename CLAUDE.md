@@ -245,3 +245,53 @@ checked items → `todo.update_item` completed after 2 consecutive misses.
   pair a NEW longer line with an erased shorter item ("Call Veer" ->
   "Call Veer re: dinner") — a length-ratio rule would break documented real
   truncations ("pe Express" is 34% of "Europe Express Change Request").
+
+## Ticks thrown away, and the dashboard rebuild (2026-10-30, branch `ticks-and-dashboard`)
+
+- **Symptom "ticks are no longer read" was never the model.** A test read on a
+  live frame (luma 59) got every checkbox right. The pipeline discarded them:
+  1. Ollama's llama-server runner wedged 2026-10-28 21:35 (another client had
+     just reloaded qwen3-vl with an 8192 context) and every request hung, text
+     prompts included, for ~44 h. `ollama stop qwen3-vl:8b-instruct` fixed it.
+     Now: reads time out after `READ_TIMEOUT_S` (240 s, was 600), a timed-out
+     read unloads the model (`keep_alive: 0`) so the next read gets a fresh
+     runner, `MODEL_FAILING_AFTER` consecutive failures turn `/healthz` 503,
+     and the dashboard shows a red banner + "Vision model" tile.
+  2. The user sits at the desk below the writing most of the day. The presence
+     regions (board half + 120 px margin) counted the head and the chair back,
+     so both boards read "occupied" and scheduled scans skipped for hours.
+     **`items_bottom`** (full-frame y, 0 = off; the blue dashed line in the
+     framing editor) cuts the presence and percentile-depth regions off at the
+     last written line (+`ITEMS_BOTTOM_MARGIN_PX`). Move it down as lists grow:
+     a line written below it is unguarded.
+  3. The reconcile-time depth guard used the per-frame percentile test, which
+     read the desk chair as an obstruction on EVERY personal-board read from
+     10-26 (57/57), so no personal tick could complete ("Go Vote!").
+     `_physically_blocked()` now prefers the presence watcher (learned empty
+     plane, which had absorbed the chair) and falls back to percentiles only
+     without fresh presence readings.
+  4. The model sets `*_obstructed` whenever a person is anywhere in shot, even
+     below the writing. With `presence_overrides_model` (default on), a board
+     whose watched area depth saw clear for the whole photo
+     (`_depth_vouched()`) has that flag overruled (`obstruction_overruled` in
+     history). Without fresh depth evidence the flag still rules.
+  5. A failed or disputed tick-confirm read now FREEZES tick streaks
+     (`{board}_unsure` from `confirm_ticks`) instead of resetting them.
+- Lines with fewer than `MIN_ITEM_CHARS` (2) alphanumerics are dropped ("U").
+- `history.jsonl` is compacted every `HISTORY_KEEP` appends, not only at boot.
+  Status carries `last_read` (last scan that actually read the boards) and
+  `model` health. The container runs on `TZ=America/New_York`.
+- Still open: the colour camera has been ~2.5x darker since 10-28 (lit scenes
+  luma ~60, was ~150; `KK_EXPOSURE=semi:8` predates it, cause unknown, look in
+  kinect-knob). A stacked, enhanced luma-59 frame read perfectly, so
+  `dim_luma` 55 is now conservative.
+- **Dashboard** (rebuilt): wide layout (max 1760 px; boards + photo in three
+  columns), item rows are a fixed grid (status box | text | state+actions).
+  The old `float:right` presence note in the card header pushed into the
+  first row and squeezed its text to one letter per line. Then status tiles
+  incl. "Boards last read" and "Vision model", banners that say why nothing
+  is being read, an outcome timeline (last 48 h, night shaded), history with
+  identical consecutive outcomes collapsed (×N) and a reads-only filter,
+  controls grouped with one-line descriptions, and the framing editor
+  collapsible and lazy (the full-frame capture only happens when opened).
+  `DASHBOARD_HTML` is a raw string now.
