@@ -144,6 +144,26 @@ def board_split(region: tuple[int, int, int, int], split: int = 0) -> int:
     return split if x1 < split < x2 else (x1 + x2) // 2
 
 
+# The writing usually fills only the top of each board; the rest is blank
+# board, and whoever sits at the desk in front of it shows up there (live
+# 2026-10-30: the chair back and the user's head sit below the last line on
+# both boards all day). ``items_bottom`` (full-frame y, 0 = off) marks where
+# the writing ends, so the presence and depth guards watch only the written
+# part — a head in front of blank board space hides nothing. Below that line
+# the asked-about region only reaches this far, not the full side margin.
+ITEMS_BOTTOM_MARGIN_PX = 30
+
+
+def items_zone(region: tuple[int, int, int, int],
+               items_bottom: int = 0) -> tuple[int, int, int, int]:
+    """The part of the crop that holds writing: the region cut off at
+    ``items_bottom``, or the whole region when that is 0 / outside it."""
+    x1, y1, x2, y2 = region
+    if y1 < items_bottom < y2:
+        y2 = items_bottom
+    return x1, y1, x2, y2
+
+
 def model_scale(w: int, h: int, upscale: float) -> float:
     """The resize factor actually applied before the model: the requested
     upscale, clamped so the result stays within MODEL_MAX_PIXELS (which
@@ -203,13 +223,16 @@ class PresenceWatcher(threading.Thread):
 
     # -- geometry -------------------------------------------------------
     def regions(self) -> dict[str, tuple[int, int, int, int]]:
-        """The two board halves, widened by PRESENCE_MARGIN_PX."""
-        x1, y1, x2, y2 = self.cfg.region
+        """The two board halves, widened by PRESENCE_MARGIN_PX — and, with
+        an items zone set, cut off just below the last written line."""
+        bottom = int(self._settings.get("items_bottom", 0) or 0)
+        x1, y1, x2, y2 = items_zone(self.cfg.region, bottom)
         mid = board_split(self.cfg.region, self._settings.get("split", 0))
         m = PRESENCE_MARGIN_PX
+        mb = ITEMS_BOTTOM_MARGIN_PX if y2 < self.cfg.region[3] else m
         return {
-            "work": (x1 - m, y1 - m, mid + m, y2 + m),
-            "personal": (mid - m, y1 - m, x2 + m, y2 + m),
+            "work": (x1 - m, y1 - m, mid + m, y2 + mb),
+            "personal": (mid - m, y1 - m, x2 + m, y2 + mb),
         }
 
     # -- polling --------------------------------------------------------
@@ -401,9 +424,11 @@ SETTING_BOUNDS = {
     "capture_format": ("jpeg", "png"),   # encoding sent to the vision model
     "region": "region",                  # crop x1,y1,x2,y2 in the 1920x1080 frame (the "zoom + pan")
     "split": "split",                    # x dividing work|personal for the presence guards; 0 = midpoint
+    "items_bottom": "items_bottom",      # y where the writing ends (guards ignore below); 0 = whole crop
+    "presence_overrides_model": bool,    # depth says the writing is clear -> ignore the model's "obstructed"
 }
 # What the framing editor previews as a draft and saves together.
-FRAMING_KEYS = ("region", "split", "enhance", "upscale", "capture_quality",
+FRAMING_KEYS = ("region", "split", "items_bottom", "enhance", "upscale", "capture_quality",
                 "capture_format", "capture_frames")
 
 # Tick detection is a PER-ITEM forced choice, not two separate lists. The
@@ -477,6 +502,9 @@ READ_SCHEMA = {
 }
 
 
+MIN_ITEM_CHARS = 2   # alphanumerics a read line needs to count as an item
+
+
 def normalise_read(raw: dict) -> dict:
     """Model output -> the reconciler's shape: {"work": [open texts],
     "work_done": [ticked texts], ..., "*_obstructed": bool}. Tolerates junk
@@ -492,7 +520,9 @@ def normalise_read(raw: dict) -> dict:
             if not isinstance(entry, dict):
                 continue
             text = str(entry.get("text") or "").strip()
-            if text:
+            # A lone letter is never a to-do: "U" — a stroke of a half-wiped
+            # board — became a real Todoist task on 2026-10-26.
+            if len(re.sub(r"[^0-9A-Za-z]", "", text)) >= MIN_ITEM_CHARS:
                 # any named mark shape counts as ticked; a missing/unknown
                 # checkbox value degrades to open (the safe direction)
                 box = entry.get("checkbox") or "empty"
@@ -601,6 +631,10 @@ class HomeAssistant:
             return None
 
 
+READ_TIMEOUT_S = 240
+MODEL_FAILING_AFTER = 3   # consecutive failed reads before /healthz goes red
+
+
 class BoardReader:
     """Local Ollama vision call: JPEG in, {'work': [...], 'personal': [...]} out.
 
@@ -612,7 +646,28 @@ class BoardReader:
         self._url = url.rstrip("/")
         self._model = model
 
+    def unload(self) -> None:
+        """Ask Ollama to drop the model so the next read starts a fresh
+        runner. 2026-10-28 21:35 the llama-server runner wedged (another
+        client had just reloaded it with a bigger context): every request
+        hung until its timeout for ~44 h, text-only prompts included, and
+        ``ollama stop`` was the whole fix."""
+        try:
+            requests.post(f"{self._url}/api/generate",
+                          json={"model": self._model, "keep_alive": 0}, timeout=30)
+            log.warning("vision model unloaded after a timed-out read — the "
+                        "next read loads a fresh runner")
+        except requests.RequestException as exc:
+            log.warning("could not unload the vision model: %s", exc)
+
     def read(self, jpeg: bytes) -> dict:
+        try:
+            return self._read(jpeg)
+        except requests.Timeout:
+            self.unload()
+            raise
+
+    def _read(self, jpeg: bytes) -> dict:
         r = requests.post(
             f"{self._url}/api/chat",
             json={
@@ -633,7 +688,10 @@ class BoardReader:
                     "images": [base64.standard_b64encode(jpeg).decode()],
                 }],
             },
-            timeout=600,  # first call loads 6 GB into VRAM; Pascal inference is leisurely
+            # (connect, read). A warm read takes ~10 s and a cold load ~45 s;
+            # 600 s only ever measured a wedged runner, holding the scan lock
+            # (and the dashboard's edits) for ten minutes per attempt.
+            timeout=(5, READ_TIMEOUT_S),
         )
         r.raise_for_status()
         content = r.json()["message"].get("content", "")
@@ -763,6 +821,11 @@ def confirm_ticks(seen: dict, seen2: Optional[dict]) -> dict:
     ``seen2 is None``, every tick) is demoted to an OPEN sighting — the
     item still counts as present, it just earns no tick evidence this
     scan. Texts stay canonical from the first read; obstruction flags OR.
+    Demoted texts are also listed under ``{board}_unsure``: reconcile
+    freezes their tick streaks instead of resetting them — a confirm read
+    that failed (model timeout, somebody walked in) or disagreed is no
+    evidence that the box is empty. Until 2026-10-30 a timed-out confirm
+    read wiped a real streak ("LR blindspot alignment") back to zero.
 
     This exists because tick false positives were observed to REPEAT
     across consecutive reads of a transiently weird scene (2026-07-08,
@@ -780,6 +843,7 @@ def confirm_ticks(seen: dict, seen2: Optional[dict]) -> dict:
             demoted = [t for t in done1 if t not in confirmed]
         merged[f"{board}_done"] = confirmed
         merged[board] = list(merged.get(board, [])) + demoted
+        merged[f"{board}_unsure"] = list(merged.get(f"{board}_unsure", [])) + demoted
         if seen2 is not None:
             merged[f"{board}_obstructed"] = bool(
                 merged.get(f"{board}_obstructed")
@@ -818,6 +882,11 @@ class Syncer:
         self.loop_beat = time.time()
         self.gate: dict = {}  # last presence-gate skip, for the dashboard
         self._camera_off_noted = False   # night-window skip recorded once
+        # Vision-model health, for the dashboard and /healthz: a wedged model
+        # once went 44 h unnoticed because the loop itself stayed healthy.
+        self.model_health = {"failures": 0, "last_ok_t": None,
+                             "last_error": None, "last_error_t": None}
+        self.last_read: dict = {}   # the last scan that actually read the boards
         self.counters = {"scans": 0, "changed": 0, "unchanged": 0, "obstructed": 0,
                          "errors": 0, "added": 0, "completed": 0, "skips_home": 0,
                          "skips_off": 0, "skips_person": 0, "skips_dim": 0,
@@ -859,6 +928,8 @@ class Syncer:
             # overrides it here, and cfg.region follows the live value.
             "region": list(cfg.region),
             "split": 0,
+            "items_bottom": 0,
+            "presence_overrides_model": True,
         }
         self.default_region = list(cfg.region)   # WB_REGION, for "reset"
         if self._settings_path.is_file():
@@ -885,9 +956,12 @@ class Syncer:
                     self.history.append(json.loads(line))
                 except json.JSONDecodeError:
                     pass
-            # rewrite the trimmed tail so the file can't grow without bound
-            self._history_path.write_text(
-                "".join(json.dumps(e) + "\n" for e in self.history))
+            self._compact_history()
+            for e in reversed(self.history):
+                if e.get("type") == "scan" and e.get("changed"):
+                    self.last_read = e
+                    break
+        self._appends = 0
 
     # -- settings ---------------------------------------------------------
     @staticmethod
@@ -916,6 +990,10 @@ class Syncer:
                     new = int(round(float(val)))
                     if not 0 <= new <= FRAME_W:
                         raise ValueError(f"out of range 0..{FRAME_W}")
+                elif spec == "items_bottom":
+                    new = int(round(float(val)))
+                    if not 0 <= new <= FRAME_H:
+                        raise ValueError(f"out of range 0..{FRAME_H}")
                 elif spec is bool:
                     if not isinstance(val, bool):
                         raise ValueError("want true/false")
@@ -1340,11 +1418,14 @@ class Syncer:
                     taken.add(hit)
                 return hit
 
-            open_matched, done_matched = set(), set()
+            open_matched, done_matched, unsure_matched = set(), set(), set()
+            unsure = {t.strip() for t in seen.get(f"{board}_unsure", [])}
             for text in seen_open:
                 match = _match_for(text)
                 if match is not None:
                     open_matched.add(match)  # keep canonical text (= Todoist summary)
+                    if text in unsure:
+                        unsure_matched.add(match)
                     pos_seen[match] = order_idx.get(text, len(order_idx))
                     continue
                 if need_seen > 1:
@@ -1465,7 +1546,8 @@ class Syncer:
                         else:
                             pending.append(item["text"])
                     elif sighted:
-                        if board not in protected and not ticked:
+                        if (board not in protected and not ticked
+                                and item["text"] not in unsure_matched):
                             item["ticked"] = 0   # read open: the streak was a misread
                         item["seen"] += 1
                         if item["seen"] >= need_seen:
@@ -1520,11 +1602,12 @@ class Syncer:
                 if sighted:
                     if apply:
                         item["missing"] = 0
-                        if board not in protected:
+                        if board not in protected and item["text"] not in unsure_matched:
                             # Read as open on a trusted frame: any tick
                             # streak was a misread — reset it. On a protected
-                            # frame the streak freezes instead (the checkbox
-                            # judgment there proves nothing either way).
+                            # frame, or when the confirm read failed or
+                            # disagreed, the streak freezes instead (that
+                            # judgment proves nothing either way).
                             item["ticked"] = 0
                     continue
                 # absent from both lists: erased, or hidden behind something
@@ -1577,7 +1660,8 @@ class Syncer:
         can't be fooled by lighting — the visual flag was observed flapping
         at night on a clear board). Best-effort: [] when the endpoint is
         unavailable (older kinect-knob) or the data is degenerate."""
-        x1, y1, x2, y2 = self.cfg.region
+        x1, y1, x2, y2 = items_zone(self.cfg.region,
+                                    self.settings.get("items_bottom", 0))
         mid = board_split(self.cfg.region, self.settings.get("split", 0))
         blocked = []
         for board, (rx1, rx2) in (("work", (x1, mid)), ("personal", (mid, x2))):
@@ -1595,6 +1679,50 @@ class Syncer:
                 blocked.append(board)
         self._depth_ok = True
         return blocked
+
+    def _physically_blocked(self, since_t: float) -> list[str]:
+        """Boards something physically covered while the photo was taken —
+        the reconcile-time depth guard.
+
+        Prefers the presence watcher (occupancy against the LEARNED empty
+        board, clipped to the items zone) over the per-frame percentile test.
+        The percentile test cannot tell furniture from a person: from
+        2026-10-26 the desk chair in front of the personal board's blank lower
+        half tripped it on every one of 57 reads, so every personal tick was
+        thrown away for four days while presence (which had learned the chair
+        as background) read the board clear."""
+        w = self.watcher
+        boards = ("work", "personal")
+        if w.supported and all(w.status(b) != "unknown" for b in boards):
+            return sorted({b for b in boards if w.status(b) == "blocked"}
+                          | set(w.blocked_since(since_t)))
+        return self._depth_obstructed()
+
+    def _depth_vouched(self, since_t: float) -> list[str]:
+        """Boards whose writing depth positively saw clear for the whole
+        photo — the evidence that overrules the model's "obstructed" flag.
+
+        The model sets that flag whenever a person is anywhere in shot, even
+        in front of blank board space well below the writing (live
+        2026-10-30: a frame with every tick read correctly came back with
+        both boards "obstructed", which threw every tick away). Depth is the
+        reliable signal (CLAUDE.md); the flag only rules where depth has no
+        fresh opinion."""
+        w = self.watcher
+        if not self.settings["presence_overrides_model"] or not w.supported:
+            return []
+        late = set(w.blocked_since(since_t))
+        return [b for b in ("work", "personal")
+                if w.status(b) == "clear" and b not in late]
+
+    @staticmethod
+    def _overrule(seen: dict, vouched: list[str]) -> list[str]:
+        """Clear the model's obstruction flag on ``vouched`` boards; returns
+        the boards it actually overruled."""
+        out = [b for b in vouched if seen.get(f"{b}_obstructed")]
+        for b in out:
+            seen[f"{b}_obstructed"] = False
+        return out
 
     def _presence_blocked(self) -> tuple[list[str], str]:
         """Boards a human is at — the question, and the evidence for it.
@@ -1760,14 +1888,21 @@ class Syncer:
             seen = self.reader.read(jpeg)
         except Exception as exc:  # noqa: BLE001 — one bad read must not kill the loop
             log.warning("board read failed: %s", exc)
+            self._model_failed(exc)
             return {"ok": False, "error": f"read failed: {exc}", **base}
+        self._model_ok()
         force_protect: tuple = ()
+        vouched: list[str] = []
         if dim:
             force_protect = ("work", "personal")
         elif self.settings["depth_guard"]:
-            force_protect = tuple(self._depth_obstructed())
+            force_protect = tuple(self._physically_blocked(capture_t0))
             if force_protect:
                 base["depth_blocked"] = list(force_protect)
+            vouched = [b for b in self._depth_vouched(capture_t0)
+                       if b not in force_protect]
+        seen = dict(seen)   # flags get overruled below; never touch the reader's dict
+        overruled = set(self._overrule(seen, vouched))
         if (not dry and not dim and self.settings["tick_confirm"]
                 and self._tick_completion_imminent(seen, force_protect)):
             # About to complete a task off this read's ticks: re-photograph
@@ -1785,10 +1920,15 @@ class Syncer:
                     log.info("someone stepped in during the tick-confirm "
                              "photo; ticks deferred")
                 else:
-                    seen2 = self.reader.read(jpeg2)
+                    try:
+                        seen2 = self.reader.read(jpeg2)
+                    except Exception as exc:  # noqa: BLE001
+                        self._model_failed(exc)
+                        raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("tick-confirm read failed (%s); ticks deferred", exc)
             seen = confirm_ticks(seen, seen2)
+            overruled |= set(self._overrule(seen, vouched))
             base["tick_confirmed"] = seen2 is not None
         if not dry:
             wipe = self._wipe_imminent(seen, force_protect)
@@ -1812,6 +1952,8 @@ class Syncer:
         blocked = [b for b in ("work", "personal") if seen.get(f"{b}_obstructed")]
         if blocked:
             base["obstructed"] = blocked
+        if overruled:
+            base["obstruction_overruled"] = sorted(overruled)
         if dim:
             base["dim"] = True
         result = self.reconcile(
@@ -1828,6 +1970,8 @@ class Syncer:
         result["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         result["t"] = round(time.time(), 1)
         self.last_result = result
+        if result.get("ok") and result.get("changed"):
+            self.last_read = {k: v for k, v in result.items() if k != "seen"}
         c = self.counters
         c["scans"] += 1
         if not result.get("ok"):
@@ -1853,6 +1997,29 @@ class Syncer:
         log.info("scan: %s", json.dumps(result))
         return result
 
+    def _compact_history(self) -> None:
+        """Rewrite the file as the in-memory tail, so it can't grow without
+        bound (at a 6 min interval it gained ~30 KB a day between boots)."""
+        try:
+            write_text = "".join(json.dumps(e) + "\n" for e in self.history)
+            tmp = self._history_path.with_name(self._history_path.name + ".tmp")
+            tmp.write_text(write_text)
+            tmp.replace(self._history_path)
+        except OSError as exc:
+            log.warning("history compaction failed: %s", exc)
+
+    def _model_ok(self) -> None:
+        self.model_health.update(failures=0, last_ok_t=round(time.time(), 1))
+
+    def _model_failed(self, exc: Exception) -> None:
+        h = self.model_health
+        h["failures"] += 1
+        h["last_error"] = str(exc)[:300]
+        h["last_error_t"] = round(time.time(), 1)
+
+    def model_failing(self) -> bool:
+        return self.model_health["failures"] >= MODEL_FAILING_AFTER
+
     def _record(self, event: dict) -> None:
         """Append to the dashboard's history (memory + jsonl under /data)."""
         event.setdefault("at", time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1865,6 +2032,10 @@ class Syncer:
                 f.write(json.dumps(event) + "\n")
         except OSError as exc:
             log.warning("history append failed: %s", exc)
+        self._appends = getattr(self, "_appends", 0) + 1
+        if self._appends >= HISTORY_KEEP:
+            self._appends = 0
+            self._compact_history()
 
     def away(self) -> bool:
         if not self.cfg.presence_entity:
@@ -1958,6 +2129,8 @@ class Syncer:
             "settings": dict(self.settings),
             "items": self.items_view,
             "last": self.last_result,
+            "last_read": self.last_read,
+            "model": {**self.model_health, "failing": self.model_failing()},
             "history": self.history,
             "counters": dict(self.counters),
             "crop_t": self.crop_t,
@@ -1965,6 +2138,7 @@ class Syncer:
                        "region": list(cfg.region),
                        "default_region": self.default_region,
                        "split": board_split(cfg.region, self.settings["split"]),
+                       "items_bottom_margin_px": ITEMS_BOTTOM_MARGIN_PX,
                        "frame": [FRAME_W, FRAME_H],
                        "model_max_pixels": MODEL_MAX_PIXELS,
                        "change_threshold": cfg.change_threshold,
@@ -3070,9 +3244,14 @@ def serve_http(syncer: Syncer) -> None:
                 # longest legit gap is one interval plus the 600s model timeout.
                 age = time.time() - syncer.loop_beat
                 stalled = age > syncer.settings["interval_s"] + 900
-                self._json(500 if stalled else 200,
-                           {"status": "loop stalled" if stalled else "ok",
-                            "loop_beat_age_s": round(age)})
+                # A loop that runs but whose every read fails is just as dead
+                # to the user (2026-10-28: 44 h of model timeouts behind "ok").
+                failing = syncer.model_failing()
+                self._json(500 if stalled else 503 if failing else 200,
+                           {"status": "loop stalled" if stalled
+                                      else "vision model failing" if failing else "ok",
+                            "loop_beat_age_s": round(age),
+                            "model": syncer.model_health})
             elif path == "/api/status":
                 self._json(200, syncer.status())
             elif path == "/state":

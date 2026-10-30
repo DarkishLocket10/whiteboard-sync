@@ -1797,3 +1797,160 @@ def test_empty_read_disputed_by_a_second_read_completes_nothing(tmp_path):
     r = s.scan(force=True)
     assert r["completed"] == [] and r["protected"] == ["work"]
     assert len(s.state["items"]) == 4
+
+
+# -- 2026-10-30: items zone, depth over the model's flag, frozen streaks ------
+
+def test_items_zone_cuts_the_region_at_the_last_written_line():
+    from wbsync import items_zone
+    assert items_zone((0, 100, 500, 900), 0) == (0, 100, 500, 900)
+    assert items_zone((0, 100, 500, 900), 600) == (0, 100, 500, 600)
+    assert items_zone((0, 100, 500, 900), 950) == (0, 100, 500, 900)  # outside: ignored
+
+
+def test_watcher_ignores_the_desk_below_the_writing(monkeypatch):
+    """The chair and the user's head sit below the last line all day; with an
+    items zone the presence regions stop just under it."""
+    from wbsync import ITEMS_BOTTOM_MARGIN_PX
+    w = make_watcher(monkeypatch, FakePresenceAPI(),
+                     settings={"presence_occupancy": 0.015, "items_bottom": 600})
+    for (_x1, y1, _x2, y2) in w.regions().values():
+        assert y1 == 280 - 120 and y2 == 600 + ITEMS_BOTTOM_MARGIN_PX
+
+
+def test_items_bottom_is_validated_and_persisted(tmp_path):
+    s = make_syncer(tmp_path)
+    assert s.update_settings({"items_bottom": 2000})["rejected"]
+    assert s.update_settings({"items_bottom": 640})["applied"] == {"items_bottom": 640}
+    assert make_syncer(tmp_path).settings["items_bottom"] == 640
+
+
+def _presence(s, status=("clear", "clear"), late=()):
+    """A watcher with fresh per-board readings."""
+    st = dict(zip(("work", "personal"), status))
+    s.watcher.supported = True
+    s.watcher.status = lambda b: st[b]
+    s.watcher.blocked_boards = lambda min_clear_s: [b for b, v in st.items() if v == "blocked"]
+    s.watcher.blocked_since = lambda since_t: list(late)
+
+
+OBSTRUCTED_TICK = {"work": [], "work_done": ["task"], "personal": [],
+                   "work_obstructed": True, "personal_obstructed": True}
+
+
+def test_clear_depth_overrules_the_models_obstructed_flag(tmp_path):
+    """Live 2026-10-30: every tick read right, both boards flagged
+    'obstructed' because the user's head was in shot below the writing."""
+    s = confirm_syncer(tmp_path, [OBSTRUCTED_TICK, OBSTRUCTED_TICK])
+    _presence(s)
+    s._depth_obstructed = lambda: pytest.fail("presence is fresh; no percentile guard")
+    result = s.scan(force=True)
+    assert result["completed"] == ["task"]
+    assert result["obstruction_overruled"] == ["personal", "work"]
+    assert "obstructed" not in result
+
+
+def test_model_flag_still_rules_without_fresh_depth(tmp_path):
+    s = confirm_syncer(tmp_path, [OBSTRUCTED_TICK])
+    _presence(s, status=("unknown", "unknown"))
+    s._depth_obstructed = lambda: []
+    result = s.scan(force=True)
+    assert result["completed"] == [] and result["obstructed"] == ["work", "personal"]
+
+
+def test_model_flag_override_can_be_turned_off(tmp_path):
+    s = confirm_syncer(tmp_path, [OBSTRUCTED_TICK])
+    s.update_settings({"presence_overrides_model": False})
+    _presence(s)
+    result = s.scan(force=True)
+    assert result["completed"] == [] and "obstruction_overruled" not in result
+
+
+def test_somebody_at_the_writing_still_protects_the_board(tmp_path):
+    s = confirm_syncer(tmp_path, [OBSTRUCTED_TICK])
+    _presence(s, status=("blocked", "clear"))
+    result = s.scan(force=True)
+    assert result["depth_blocked"] == ["work"] and result["completed"] == []
+
+
+def test_furniture_the_presence_model_learned_does_not_protect(tmp_path):
+    """The percentile guard read the desk chair as an obstruction on every
+    personal-board read for four days; fresh presence readings win."""
+    s = make_syncer(tmp_path)
+    s.update_settings({"tick_confirm": False})
+    s.reconcile({"work": [], "personal": ["chore"]})
+    _presence(s)
+    s._depth_obstructed = lambda: ["personal"]
+    s.reader = SeqReader([{"work": [], "personal": [], "personal_done": ["chore"],
+                           "work_obstructed": False, "personal_obstructed": False}])
+    fake_fetch(s)
+    result = s.scan(force=True)
+    assert "depth_blocked" not in result and result["completed"] == ["chore"]
+
+
+def test_a_failed_confirm_read_freezes_the_streak(tmp_path):
+    s = confirm_syncer(tmp_path, [TICKED])
+    s.update_settings({"ticked_to_complete": 2})
+    s.scan(force=True)                                   # tick 1 of 2
+    assert s.state["items"][0]["ticked"] == 1
+    s.reader.seens = [TICKED, RuntimeError("timed out")]
+    result = s.scan(force=True)                          # confirm read dies
+    assert result["completed"] == []
+    assert s.state["items"][0]["ticked"] == 1            # frozen, not reset
+    s.reader.seens = [TICKED, TICKED]
+    assert s.scan(force=True)["completed"] == ["task"]
+
+
+def test_a_clean_open_read_still_resets_the_streak(tmp_path):
+    s = confirm_syncer(tmp_path, [TICKED])
+    s.update_settings({"ticked_to_complete": 2})
+    s.scan(force=True)
+    s.reader.seens = [OPEN]
+    s.scan(force=True)
+    assert s.state["items"][0]["ticked"] == 0
+
+
+def test_a_lone_letter_is_not_an_item():
+    seen = normalise_read({"work": [{"text": "U", "checkbox": "empty"},
+                                    {"text": "Go", "checkbox": "empty"}],
+                           "personal": [{"text": "-", "checkbox": "slash"}]})
+    assert seen["work"] == ["Go"] and seen["personal_done"] == []
+
+
+def test_model_failures_are_counted_and_cleared(tmp_path):
+    from wbsync import MODEL_FAILING_AFTER
+    s = make_syncer(tmp_path)
+    fake_fetch(s)
+    s.reader = SeqReader([RuntimeError("timed out")] * MODEL_FAILING_AFTER + [OPEN])
+    for _ in range(MODEL_FAILING_AFTER):
+        assert s.scan(force=True)["ok"] is False
+    assert s.model_failing() and s.status()["model"]["failing"] is True
+    s.scan(force=True)
+    assert s.model_health["failures"] == 0 and s.model_health["last_ok_t"]
+    assert s.status()["last_read"]["changed"] is True
+
+
+def test_a_timed_out_read_unloads_the_wedged_model(monkeypatch):
+    import requests as rq
+    from wbsync import BoardReader
+    posts = []
+
+    def fake_post(url, json=None, timeout=None):
+        posts.append((url, json))
+        if url.endswith("/api/chat"):
+            raise rq.ReadTimeout("read timed out")
+        return type("R", (), {"status_code": 200})()
+    monkeypatch.setattr("wbsync.requests.post", fake_post)
+    with pytest.raises(rq.Timeout):
+        BoardReader("http://ollama", "m").read(b"img")
+    assert posts[-1] == ("http://ollama/api/generate", {"model": "m", "keep_alive": 0})
+
+
+def test_history_file_is_compacted_while_running(tmp_path):
+    from wbsync import HISTORY_KEEP
+    s = make_syncer(tmp_path)
+    for i in range(HISTORY_KEEP * 2 + 5):
+        s._record({"type": "skip", "reason": "x", "i": i})
+    lines = (tmp_path / "history.jsonl").read_text().splitlines()
+    assert len(lines) <= HISTORY_KEEP * 2
+    assert json.loads(lines[-1])["i"] == HISTORY_KEEP * 2 + 4

@@ -7,6 +7,10 @@ services:
     container_name: whiteboard-sync
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Local time for logs, history and the dashboard (the host and kinect-knob's
+      # night window are on America/New_York; UTC timestamps were 4-5 h off).
+      TZ: America/New_York
     ports:
       - "8430:8430"
     volumes:
